@@ -90,9 +90,10 @@ all `HWND`/`HDC` handling is confined here.
 ### `capture-linux`
 Provides the same two traits behind `#[cfg(target_os = "linux")]`. X11 uses
 RandR 1.5 monitor enumeration, root-window `GetImage` capture, and EWMH client
-stacking/window geometry for snap candidates. Wayland is detected explicitly and
-returns an actionable `Unsupported` result until a frontend supplies the
-XDG ScreenCast portal/PipeWire bridge.
+stacking/window geometry for snap candidates. Native Wayland uses the XDG
+ScreenCast portal and a short-lived PipeWire consumer to obtain an authorized
+single frame. Pure Wayland has no global window-list protocol, so window-level
+snap remains unavailable there; XWayland continues to use the X11 path.
 
 ## 3. What each frontend implements (NOT in Core)
 

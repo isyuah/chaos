@@ -1,9 +1,10 @@
-//! `capture-linux` — Linux X11 capture and EWMH window snapping.
+//! `capture-linux` — Linux X11/Wayland capture and EWMH window snapping.
 //!
 //! X11 is implemented with RandR monitor enumeration, root-window `GetImage`
-//! capture, and EWMH client-list/window geometry queries. Wayland is detected
-//! explicitly and returns an actionable `Unsupported` error because a portal
-//! capture requires user permission and a frontend-owned PipeWire consumer.
+//! capture, and EWMH client-list/window geometry queries. Native Wayland uses
+//! the XDG ScreenCast portal and a short-lived PipeWire consumer for an
+//! authorized frame. Pure Wayland has no global window-list protocol, so
+//! window-level snap remains unavailable there.
 
 #[cfg(target_os = "linux")]
 pub mod linux;

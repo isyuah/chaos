@@ -210,10 +210,11 @@ capture of monitor 0 produced `2560x1440 origin=(-2560,0)`.
 - `capture-linux` implements both traits and cross-checks cleanly for
   `x86_64-unknown-linux-gnu`. X11 uses RandR 1.5 monitor enumeration,
   root-window `GetImage` capture, and EWMH client-list/window geometry queries;
-  it returns real frames and snap candidates. Wayland is detected explicitly
-  and returns an actionable `Unsupported` result until the frontend supplies
-  the XDG ScreenCast portal / PipeWire bridge. Wayland's global-window-positioning
-  and always-on-top limitations remain documented in `00_DEMO_COMMON_SPEC.md` §16.
+  it returns real frames and snap candidates. Native Wayland uses the XDG
+  ScreenCast portal and PipeWire to obtain a user-authorized single frame;
+  monitor metadata comes from the selected portal stream. Wayland's
+  global-window-positioning and always-on-top limitations remain documented in
+  `00_DEMO_COMMON_SPEC.md` §16.
 
 ---
 
@@ -222,11 +223,13 @@ capture of monitor 0 produced `2560x1440 origin=(-2560,0)`.
 | crate | native dep | scope |
 |---|---|---|
 | `capture-windows` | `windows` 0.61 (features: `Win32_Foundation`, `Win32_Graphics_Gdi`, `Win32_Graphics_Dwm`, `Win32_UI_HiDpi`, `Win32_UI_WindowsAndMessaging`) | GDI capture, DPI awareness, DWM bounds, window enumeration |
-| `capture-linux` | `x11rb` 0.14 (`image`, `randr`) | X11 RandR/GetImage capture and EWMH snap |
+| `capture-linux` | `x11rb` 0.14 (`image`, `randr`), `ashpd` 0.12.3, `pipewire` 0.8 | X11 RandR/GetImage + EWMH snap; Wayland ScreenCast/PipeWire capture |
 | `tools/capture-cli` | `arboard` 3 (Windows clipboard), `clap` 4 | CLI UX + clipboard demo |
 
 Other Rust deps across the workspace: `thiserror`, `png`, `clap`, `arboard`,
-plus their transitive deps. No C library or build.rs is required.
+`tokio`, plus their transitive deps. Linux builds require the system
+`libpipewire-0.3-dev` and `libclang-dev` packages for the native PipeWire
+bindings; CI installs them on Ubuntu.
 
 ---
 
@@ -250,14 +253,15 @@ two `extern "system"` callbacks; there is no `unsafe` in any domain crate.
 
 ## 8. Tests
 
-`cargo test --workspace` → **65 unit tests on Windows, 67 on Linux, 0 failures, 0 warnings.**
+`cargo test --workspace` → **65 unit tests on Windows, 69 on Linux, 0 failures, 0 warnings.**
 
 | crate | tests | covers |
 |---|---|---|
 | `capture-core` | 44 | geometry overflow/negative coords, mixed-DPI mapping, pixel formats/stride/crop, snap Z-order, toolbar placement, selection geometry |
 | `capture-annotation` | 9 | session lifecycle, candidate switching, move/resize, annotation clamping, unified undo/redo, structured errors |
-| `capture-render` | 7 | crop copy, negative-origin crop, deterministic pen, **golden checksum**, PNG header, safe save replacement/failure |
+| `capture-render` | 8 | crop copy, negative-origin crop, deterministic pen, **golden checksum**, PNG header, safe save replacement/failure |
 | `capture-actions` | 4 | copy PNG payload, save writes file, stable IDs, Save registry |
+| `capture-linux` | 4 | X11 pixel conversion and Wayland PipeWire frame conversion/error handling |
 
 `docs/architecture/*` and `docs/adr/*` are part of the frozen tree.
 
@@ -345,9 +349,10 @@ the two frontends will use.
 3. **Snap scope:** window candidates follow OS `EnumWindows` Z-order on Windows;
    area is only a deterministic tie-break when the platform gives equal order.
    Element-level snapping is not implemented (`element_level=false`).
-4. **Linux runtime verification is environment-dependent** (see §5). The X11
-   route is implemented, but no Linux display server was available on this
-   Windows host; native Wayland still requires the portal/PipeWire bridge.
+4. **Linux desktop runtime verification is environment-dependent** (see §5).
+   Both X11 and native Wayland routes are implemented and Linux builds/tests
+   pass in WSL, but this Windows host has no X11 server, Wayland compositor,
+   desktop portal, or PipeWire session for a real capture/authorization test.
 5. **Clipboard:** `capture-actions` produces payloads only; the OS clipboard
    write is the caller's job. The CLI demonstrates it via `arboard`, which works
    in a console process subject to OLE/STA behavior on the caller side.
@@ -445,5 +450,5 @@ The current untagged working tree addresses the defects found during review:
 - CI runs format, Clippy, tests, and release builds on Linux and Windows.
 
 The remaining deliberate boundaries are GDI's protected-content limitation,
-native Wayland portal/PipeWire integration, and the absence of the separate
-Slint/QML frontend applications in this workspace.
+Wayland's lack of a portable global window-list/overlay protocol, and the
+absence of the separate Slint/QML frontend applications in this workspace.

@@ -1,11 +1,15 @@
-//! Linux X11 capture and EWMH window snapping.
+//! Linux X11 and native Wayland capture with EWMH window snapping.
 //!
 //! The backend connects lazily, so a frontend can construct its platform before
 //! the display is ready. X11 uses RandR 1.5 monitor descriptions, root-window
 //! `GetImage` capture, and EWMH client-list/window geometry queries. Wayland is
-//! detected explicitly and returns an actionable error because a portal capture
-//! requires user permission and a frontend-owned PipeWire consumer.
+//! native Wayland uses the XDG ScreenCast portal and a short-lived PipeWire
+//! consumer to obtain an authorized frame. Window enumeration remains an X11
+//! capability because Wayland intentionally does not expose a global window
+//! list.
 
+use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType, Stream as PortalStream};
+use ashpd::desktop::PersistMode;
 use capture_core::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
 use capture_core::{
     CaptureCapabilities, CaptureError, CapturedFrame, MonitorId, MonitorInfo, PixelFormat,
@@ -13,7 +17,13 @@ use capture_core::{
     SnapKind,
 };
 use capture_platform_api::{CaptureBackend, SnapBackend};
+use pipewire as pw;
+use pw::properties::properties;
+use pw::spa;
+use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
+use std::os::fd::OwnedFd;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as RandrConnectionExt;
 use x11rb::protocol::xproto::{
@@ -36,28 +46,54 @@ const NET_WM_WINDOW_TYPE_UTILITY: &[u8] = b"_NET_WM_WINDOW_TYPE_UTILITY";
 const NET_WORKAREA: &[u8] = b"_NET_WORKAREA";
 const UTF8_STRING: &[u8] = b"UTF8_STRING";
 
-/// Linux capture backend. X11 is supported; Wayland reports a deterministic
-/// unsupported error until the portal/PipeWire frontend bridge is supplied.
+/// Linux capture backend.
+///
+/// X11 is used when `DISPLAY` is available. Pure Wayland uses the ScreenCast
+/// portal and PipeWire. The portal asks the user to choose a monitor or virtual
+/// desktop for each synchronous capture request, which keeps permission and
+/// session ownership explicit at the Core boundary.
 pub struct LinuxCaptureBackend;
 
 impl CaptureBackend for LinuxCaptureBackend {
     fn capabilities(&self) -> CaptureCapabilities {
         let x11_available = std::env::var_os("DISPLAY").is_some();
+        let wayland_available = std::env::var_os("WAYLAND_DISPLAY").is_some();
         CaptureCapabilities {
-            multi_monitor: x11_available,
+            multi_monitor: x11_available || wayland_available,
             per_monitor_dpi: false,
-            capture_virtual_desktop: x11_available,
+            capture_virtual_desktop: x11_available || wayland_available,
             capture_window: false,
             live_preview: false,
         }
     }
 
     fn monitors(&self) -> Result<Vec<MonitorInfo>, CaptureError> {
-        let display = connect_x11()?;
-        enumerate_monitors(&display)
+        if std::env::var_os("DISPLAY").is_some() {
+            return enumerate_monitors(&connect_x11()?);
+        }
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return query_wayland_monitors();
+        }
+        enumerate_monitors(&connect_x11()?)
     }
 
     fn capture_monitor(&self, id: MonitorId) -> Result<CapturedFrame, CaptureError> {
+        if std::env::var_os("DISPLAY").is_some() {
+            let display = connect_x11()?;
+            let monitors = enumerate_monitors(&display)?;
+            let monitor = monitors
+                .iter()
+                .find(|monitor| monitor.id == id)
+                .ok_or(CaptureError::MonitorNotFound(id))?;
+            return capture_virtual_desktop_x11(&display)?.crop(monitor.bounds);
+        }
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            let (frame, monitor) = capture_wayland(SourceType::Monitor)?;
+            if monitor.id != id {
+                return Err(CaptureError::MonitorNotFound(id));
+            }
+            return Ok(frame);
+        }
         let display = connect_x11()?;
         let monitors = enumerate_monitors(&display)?;
         let monitor = monitors
@@ -68,8 +104,13 @@ impl CaptureBackend for LinuxCaptureBackend {
     }
 
     fn capture_virtual_desktop(&self) -> Result<CapturedFrame, CaptureError> {
-        let display = connect_x11()?;
-        capture_virtual_desktop_x11(&display)
+        if std::env::var_os("DISPLAY").is_some() {
+            return capture_virtual_desktop_x11(&connect_x11()?);
+        }
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return capture_wayland(SourceType::Virtual).map(|(frame, _)| frame);
+        }
+        capture_virtual_desktop_x11(&connect_x11()?)
     }
 }
 
@@ -172,6 +213,447 @@ fn connect_x11() -> Result<X11Display, CaptureError> {
             "cannot connect to X11 display: {error}"
         ))),
     }
+}
+
+#[derive(Debug)]
+struct PortalCaptureContext {
+    stream: PortalStream,
+    pipewire_fd: OwnedFd,
+}
+
+fn query_wayland_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
+    let context = open_wayland_stream(SourceType::Monitor)?;
+    Ok(vec![wayland_monitor_info(&context.stream, None)])
+}
+
+fn capture_wayland(source_type: SourceType) -> Result<(CapturedFrame, MonitorInfo), CaptureError> {
+    let context = open_wayland_stream(source_type)?;
+    let origin = context
+        .stream
+        .position()
+        .map(|(x, y)| PhysicalPoint::new(x, y))
+        .unwrap_or(PhysicalPoint::ZERO);
+    let frame = capture_pipewire_frame(
+        context.stream.pipe_wire_node_id(),
+        context.pipewire_fd,
+        origin,
+    )?;
+    let monitor = wayland_monitor_info(&context.stream, Some((frame.width, frame.height)));
+    Ok((frame, monitor))
+}
+
+fn open_wayland_stream(source_type: SourceType) -> Result<PortalCaptureContext, CaptureError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            CaptureError::BackendUnavailable(format!(
+                "cannot create Wayland portal runtime: {error}"
+            ))
+        })?;
+    runtime.block_on(async move {
+        let proxy = Screencast::new().await.map_err(portal_error)?;
+        let session = proxy.create_session().await.map_err(portal_error)?;
+        proxy
+            .select_sources(
+                &session,
+                CursorMode::Hidden,
+                source_type.into(),
+                false,
+                None,
+                PersistMode::DoNot,
+            )
+            .await
+            .map_err(portal_error)?;
+        let response = proxy
+            .start(&session, None)
+            .await
+            .map_err(portal_error)?
+            .response()
+            .map_err(portal_error)?;
+        let stream = response.streams().first().cloned().ok_or_else(|| {
+            CaptureError::CaptureFailed(
+                "Wayland portal returned no selected PipeWire stream".to_string(),
+            )
+        })?;
+        let pipewire_fd = proxy
+            .open_pipe_wire_remote(&session)
+            .await
+            .map_err(portal_error)?;
+        Ok(PortalCaptureContext {
+            stream,
+            pipewire_fd,
+        })
+    })
+}
+
+fn portal_error(error: impl std::fmt::Display) -> CaptureError {
+    CaptureError::Unsupported(format!("Wayland ScreenCast portal request failed: {error}"))
+}
+
+fn wayland_monitor_info(stream: &PortalStream, captured_size: Option<(u32, u32)>) -> MonitorInfo {
+    let (logical_width, logical_height) = stream
+        .size()
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .map(|(width, height)| (width as u32, height as u32))
+        .unwrap_or((1, 1));
+    let (width, height) = captured_size.unwrap_or((logical_width, logical_height));
+    let origin = stream
+        .position()
+        .map(|(x, y)| PhysicalPoint::new(x, y))
+        .unwrap_or(PhysicalPoint::ZERO);
+    let bounds = PhysicalRect::new(origin, PhysicalSize::new(width.max(1), height.max(1)));
+    let key = stream
+        .id()
+        .map(|id| format!("wayland-portal-{id}"))
+        .unwrap_or_else(|| format!("wayland-portal-node-{}", stream.pipe_wire_node_id()));
+    let scale = if logical_width > 0 {
+        ScaleFactor::new(width as f64 / logical_width as f64)
+    } else {
+        ScaleFactor::new(1.0)
+    };
+    MonitorInfo {
+        id: MonitorId::from_stable_key(&key),
+        name: stream
+            .id()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "Wayland portal monitor".to_string()),
+        bounds,
+        work_area: bounds,
+        scale_factor: scale,
+        is_primary: true,
+    }
+}
+
+struct PipewireCaptureData {
+    format: VideoInfoRaw,
+    frame_sent: bool,
+    sender: std::sync::mpsc::SyncSender<Result<RawPipewireFrame, String>>,
+}
+
+struct RawPipewireFrame {
+    width: u32,
+    height: u32,
+    stride: i32,
+    format: VideoFormat,
+    pixels: Vec<u8>,
+}
+
+fn capture_pipewire_frame(
+    node_id: u32,
+    pipewire_fd: OwnedFd,
+    origin: PhysicalPoint,
+) -> Result<CapturedFrame, CaptureError> {
+    pw::init();
+    let main_loop = pw::main_loop::MainLoop::new(None).map_err(|error| {
+        CaptureError::BackendUnavailable(format!("PipeWire main loop: {error}"))
+    })?;
+    let context = pw::context::Context::new(&main_loop)
+        .map_err(|error| CaptureError::BackendUnavailable(format!("PipeWire context: {error}")))?;
+    let core = context
+        .connect_fd(pipewire_fd, None)
+        .map_err(|error| CaptureError::BackendUnavailable(format!("PipeWire connect: {error}")))?;
+    let stream = pw::stream::Stream::new(
+        &core,
+        "capture-core-wayland",
+        properties! {
+            *pw::keys::MEDIA_TYPE => "Video",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Screen",
+        },
+    )
+    .map_err(|error| CaptureError::BackendUnavailable(format!("PipeWire stream: {error}")))?;
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let listener = stream
+        .add_local_listener_with_user_data(PipewireCaptureData {
+            format: VideoInfoRaw::default(),
+            frame_sent: false,
+            sender,
+        })
+        .state_changed(|_, data, _, state| {
+            if let pw::stream::StreamState::Error(error) = state {
+                if !data.frame_sent {
+                    let _ = data.sender.try_send(Err(format!("PipeWire stream: {error}")));
+                    data.frame_sent = true;
+                }
+            }
+        })
+        .param_changed(|_, data, id, param| {
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            if let Some(param) = param {
+                let _ = data.format.parse(param);
+            }
+        })
+        .process(|stream, data| {
+            if data.frame_sent {
+                return;
+            }
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let Some(data_block) = buffer.datas_mut().first_mut() else {
+                let _ = data.sender.try_send(Err("PipeWire buffer has no data plane".to_string()));
+                data.frame_sent = true;
+                return;
+            };
+            let offset = data_block.chunk().offset() as usize;
+            let size = data_block.chunk().size() as usize;
+            let stride = data_block.chunk().stride();
+            let Some(bytes) = data_block.data() else {
+                let _ = data.sender.try_send(Err(
+                    "PipeWire frame uses an unmapped buffer; DMA-BUF import is not available in Core"
+                        .to_string(),
+                ));
+                data.frame_sent = true;
+                return;
+            };
+            match copy_pipewire_frame(&data.format, bytes, offset, size, stride) {
+                Ok(frame) => {
+                    let _ = data.sender.try_send(Ok(frame));
+                }
+                Err(error) => {
+                    let _ = data.sender.try_send(Err(error));
+                }
+            }
+            data.frame_sent = true;
+        })
+        .register()
+        .map_err(|error| CaptureError::BackendUnavailable(format!("PipeWire listener: {error}")))?;
+
+    let values = build_pipewire_video_params().map_err(CaptureError::CaptureFailed)?;
+    let pod = spa::pod::Pod::from_bytes(&values).ok_or_else(|| {
+        CaptureError::CaptureFailed("failed to build PipeWire video format pod".to_string())
+    })?;
+    let mut params = [pod];
+    stream
+        .connect(
+            spa::utils::Direction::Input,
+            Some(node_id),
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )
+        .map_err(|error| {
+            CaptureError::BackendUnavailable(format!("PipeWire stream connect: {error}"))
+        })?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let raw = loop {
+        match receiver.try_recv() {
+            Ok(result) => break result.map_err(CaptureError::CaptureFailed)?,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(CaptureError::CaptureFailed(
+                    "PipeWire capture callback disconnected".to_string(),
+                ))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(CaptureError::CaptureFailed(
+                "timed out waiting for the first Wayland PipeWire frame".to_string(),
+            ));
+        }
+        main_loop.loop_().iterate(Duration::from_millis(100));
+    };
+    drop(listener);
+    raw_to_frame(raw, origin)
+}
+
+fn copy_pipewire_frame(
+    format: &VideoInfoRaw,
+    bytes: &[u8],
+    offset: usize,
+    size: usize,
+    stride: i32,
+) -> Result<RawPipewireFrame, String> {
+    if !matches!(
+        format.format(),
+        VideoFormat::RGBA | VideoFormat::BGRA | VideoFormat::RGBx | VideoFormat::BGRx
+    ) {
+        return Err(format!(
+            "PipeWire negotiated unsupported video format: {:?}",
+            format.format()
+        ));
+    }
+    let rectangle = format.size();
+    let width = rectangle.width;
+    let height = rectangle.height;
+    if width == 0 || height == 0 {
+        return Err("PipeWire negotiated an empty video frame".to_string());
+    }
+    let source_stride = if stride > 0 {
+        usize::try_from(stride).map_err(|_| "PipeWire stride overflows usize".to_string())?
+    } else {
+        return Err("PipeWire returned a non-positive video stride".to_string());
+    };
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| "PipeWire row size overflows usize".to_string())?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| "PipeWire chunk bounds overflow".to_string())?;
+    if end > bytes.len() {
+        return Err("PipeWire chunk lies outside the mapped buffer".to_string());
+    }
+    let required = usize::try_from(height - 1)
+        .ok()
+        .and_then(|last| last.checked_mul(source_stride))
+        .and_then(|last| last.checked_add(row_bytes))
+        .and_then(|last| offset.checked_add(last))
+        .ok_or_else(|| "PipeWire frame bounds overflow".to_string())?;
+    if required > end {
+        return Err("PipeWire frame is shorter than its negotiated geometry".to_string());
+    }
+    Ok(RawPipewireFrame {
+        width,
+        height,
+        stride,
+        format: format.format(),
+        pixels: bytes[offset..end].to_vec(),
+    })
+}
+
+fn raw_to_frame(
+    raw: RawPipewireFrame,
+    origin: PhysicalPoint,
+) -> Result<CapturedFrame, CaptureError> {
+    let row_bytes = usize::try_from(raw.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| {
+            CaptureError::InvalidFrame("Wayland row size overflows usize".to_string())
+        })?;
+    let stride = usize::try_from(raw.stride)
+        .map_err(|_| CaptureError::InvalidFrame("Wayland stride is invalid".to_string()))?;
+    let output_len = row_bytes.checked_mul(raw.height as usize).ok_or_else(|| {
+        CaptureError::InvalidFrame("Wayland frame size overflows usize".to_string())
+    })?;
+    let mut rgba = vec![0u8; output_len];
+    for y in 0..raw.height as usize {
+        let source_start = y.checked_mul(stride).ok_or_else(|| {
+            CaptureError::InvalidFrame("Wayland row offset overflows usize".to_string())
+        })?;
+        let source_end = source_start.checked_add(row_bytes).ok_or_else(|| {
+            CaptureError::InvalidFrame("Wayland row end overflows usize".to_string())
+        })?;
+        let source = raw
+            .pixels
+            .get(source_start..source_end)
+            .ok_or_else(|| CaptureError::InvalidFrame("Wayland row is unavailable".to_string()))?;
+        let destination = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+        for (source_pixel, destination_pixel) in
+            source.chunks_exact(4).zip(destination.chunks_exact_mut(4))
+        {
+            match raw.format {
+                VideoFormat::RGBA => destination_pixel.copy_from_slice(source_pixel),
+                VideoFormat::BGRA => destination_pixel.copy_from_slice(&[
+                    source_pixel[2],
+                    source_pixel[1],
+                    source_pixel[0],
+                    source_pixel[3],
+                ]),
+                VideoFormat::RGBx => destination_pixel.copy_from_slice(&[
+                    source_pixel[0],
+                    source_pixel[1],
+                    source_pixel[2],
+                    255,
+                ]),
+                VideoFormat::BGRx => destination_pixel.copy_from_slice(&[
+                    source_pixel[2],
+                    source_pixel[1],
+                    source_pixel[0],
+                    255,
+                ]),
+                format => {
+                    return Err(CaptureError::FormatUnsupported(format_to_pixel_format(
+                        format,
+                    )))
+                }
+            }
+        }
+    }
+    Ok(CapturedFrame::new(
+        rgba.into(),
+        raw.width,
+        raw.height,
+        raw.width.saturating_mul(4),
+        origin,
+        PixelFormat::Rgba8,
+    ))
+}
+
+fn format_to_pixel_format(format: VideoFormat) -> PixelFormat {
+    if format == VideoFormat::RGBx || format == VideoFormat::RGBA {
+        PixelFormat::Rgba8
+    } else if format == VideoFormat::BGRx || format == VideoFormat::BGRA {
+        PixelFormat::Bgra8
+    } else {
+        PixelFormat::Rgb24
+    }
+}
+
+fn build_pipewire_video_params() -> Result<Vec<u8>, String> {
+    let object = spa::pod::object!(
+        spa::utils::SpaTypes::ObjectParamFormat,
+        spa::param::ParamType::EnumFormat,
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaType,
+            Id,
+            spa::param::format::MediaType::Video
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            spa::param::format::MediaSubtype::Raw
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::BGRx,
+            VideoFormat::BGRx,
+            VideoFormat::RGBx,
+            VideoFormat::BGRA,
+            VideoFormat::RGBA
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            spa::utils::Rectangle {
+                width: 1280,
+                height: 720
+            },
+            spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            spa::utils::Fraction { num: 30, denom: 1 },
+            spa::utils::Fraction { num: 0, denom: 1 },
+            spa::utils::Fraction { num: 120, denom: 1 }
+        )
+    );
+    spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(object),
+    )
+    .map(|(bytes, _)| bytes.into_inner())
+    .map_err(|error| format!("PipeWire format serialization failed: {error:?}"))
 }
 
 fn root(display: &X11Display) -> &x11rb::protocol::xproto::Screen {
@@ -606,5 +1088,31 @@ mod tests {
     fn mask_scaling_handles_opaque_channel() {
         assert_eq!(mask_to_u8(0xFF, 0xFF), 255);
         assert_eq!(mask_to_u8(0, 0xFF), 0);
+    }
+
+    #[test]
+    fn pipewire_bgrx_frame_is_converted_to_rgba() {
+        let mut format = VideoInfoRaw::default();
+        format.set_format(VideoFormat::BGRx);
+        format.set_size(spa::utils::Rectangle {
+            width: 1,
+            height: 1,
+        });
+        let raw = copy_pipewire_frame(&format, &[10, 20, 30, 0], 0, 4, 4)
+            .expect("BGRx frame should be copied");
+        let frame = raw_to_frame(raw, PhysicalPoint::new(-4, 8)).expect("frame should convert");
+        assert_eq!(frame.origin, PhysicalPoint::new(-4, 8));
+        assert_eq!(frame.pixels.as_ref(), &[30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn pipewire_unsupported_format_is_rejected_before_copy() {
+        let mut format = VideoInfoRaw::default();
+        format.set_format(VideoFormat::RGB);
+        format.set_size(spa::utils::Rectangle {
+            width: 1,
+            height: 1,
+        });
+        assert!(copy_pipewire_frame(&format, &[], 0, 0, 3).is_err());
     }
 }

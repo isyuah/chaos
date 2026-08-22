@@ -14,7 +14,7 @@ crates/capture-annotation     annotation document, undo, capture session state m
 crates/capture-render         flatten + PNG encode + golden tests
 crates/capture-actions        Copy / Save / Pin / AskAI payloads
 crates/capture-windows        GDI capture + window snap (real)
-crates/capture-linux          X11 capture + EWMH snap; Wayland capability route
+crates/capture-linux          X11/EWMH + native Wayland Portal/PipeWire capture
 tools/capture-cli             acceptance CLI for the frozen Core
 docs/                         architecture + ADRs + change-request template
 ```

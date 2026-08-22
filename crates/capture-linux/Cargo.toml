@@ -5,10 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Linux X11 capture and window snap backend with Wayland capability detection."
+description = "Linux X11/EWMH and native Wayland Portal/PipeWire capture backend."
 
 [target.'cfg(target_os = "linux")'.dependencies]
 capture-core.workspace = true
 capture-platform-api.workspace = true
 thiserror.workspace = true
 x11rb = { version = "0.14", default-features = false, features = ["image", "randr"] }
+ashpd = "0.12.3"
+pipewire = "0.8"
+tokio = { version = "1", features = ["rt", "time"] }
