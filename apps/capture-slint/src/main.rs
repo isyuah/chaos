@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 slint::include_modules!();
 
@@ -57,6 +58,7 @@ struct Controller {
     scale_factor: f64,
     status: String,
     pin_window: Option<PinWindow>,
+    last_snap_at: Option<Instant>,
 }
 
 fn make_host() -> Result<HostPlatform, String> {
@@ -76,15 +78,32 @@ fn make_host() -> Result<HostPlatform, String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = make_host()?;
-    let monitors = host.capture().monitors()?;
     let ordinal = std::env::var("CAPTURE_MONITOR")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0);
-    let monitor = monitors
-        .get(ordinal)
-        .ok_or_else(|| format!("monitor ordinal {ordinal} is unavailable"))?;
-    let frame = Arc::new(host.capture().capture_monitor(monitor.id)?.to_rgba8()?);
+        .and_then(|value| value.parse::<usize>().ok());
+    let (frame, scale_factor, status) = if let Some(ordinal) = ordinal {
+        let monitors = host.capture().monitors()?;
+        let monitor = monitors
+            .get(ordinal)
+            .ok_or_else(|| format!("monitor ordinal {ordinal} is unavailable"))?;
+        (
+            Arc::new(host.capture().capture_monitor(monitor.id)?.to_rgba8()?),
+            monitor.scale_factor.get().max(0.1),
+            format!(
+                "{}  {}x{}",
+                monitor.name,
+                monitor.bounds.width(),
+                monitor.bounds.height()
+            ),
+        )
+    } else {
+        let frame = Arc::new(host.capture().capture_virtual_desktop()?.to_rgba8()?);
+        (
+            frame.clone(),
+            1.0,
+            format!("Virtual desktop  {}x{}", frame.width, frame.height),
+        )
+    };
 
     let ui = CaptureWindow::new()?;
     ui.window()
@@ -93,9 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host,
         session: CaptureSession::new(),
         frame: frame.clone(),
-        scale_factor: monitor.scale_factor.get().max(0.1),
-        status: format!("{}  {}x{}", monitor.name, frame.width, frame.height),
+        scale_factor,
+        status,
         pin_window: None,
+        last_snap_at: None,
     }));
 
     {
@@ -141,20 +161,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut controller = state.borrow_mut();
             let point = controller.to_physical(x, y);
+            let dragging = matches!(
+                controller.session.state(),
+                CaptureSessionState::Selecting(selection)
+                    if selection.interaction == SelectionInteraction::Dragging
+            );
             if matches!(
                 controller.session.state(),
                 CaptureSessionState::Selecting(_)
             ) {
-                match controller.host.snap().candidates_at(point) {
-                    Ok(candidates) => controller
-                        .apply(CaptureCommand::SnapCandidate(candidates.into_iter().next())),
-                    Err(error) => controller.status = format!("Snap unavailable: {error}"),
+                if !dragging && controller.should_query_snap() {
+                    match controller.host.snap().candidates_at(point) {
+                        Ok(candidates) => controller
+                            .apply(CaptureCommand::SnapCandidate(candidates.into_iter().next())),
+                        Err(error) => controller.status = format!("Snap unavailable: {error}"),
+                    }
                 }
                 controller.apply(CaptureCommand::UpdateFreeSelection(point));
             } else if matches!(controller.session.state(), CaptureSessionState::Editing(_)) {
                 controller.apply(CaptureCommand::UpdateAnnotation(point));
+                refresh_editor_image(&ui, &controller);
             }
-            refresh_ui(&ui, &controller);
+            refresh_selection_ui(&ui, &controller);
         });
     }
 
@@ -207,6 +235,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ui.show()?;
+    {
+        let mut controller = state.borrow_mut();
+        controller.scale_factor = ui.window().scale_factor() as f64;
+        sync_window_geometry(&ui, &controller, controller.frame.bounds());
+    }
     slint::run_event_loop()?;
     Ok(())
 }
@@ -235,6 +268,18 @@ impl Controller {
                 self.status = error.to_string();
             }
         }
+    }
+
+    fn should_query_snap(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_snap_at
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(32))
+        {
+            return false;
+        }
+        self.last_snap_at = Some(now);
+        true
     }
 
     fn run_action(&mut self, action: &str, ui: &CaptureWindow) {
@@ -292,6 +337,10 @@ impl Controller {
                                 rendered.width,
                                 rendered.height,
                             ));
+                            pin.window().set_position(slint::PhysicalPosition::new(
+                                document.crop.origin.x.saturating_add(16),
+                                document.crop.origin.y.saturating_add(16),
+                            ));
                             let pin_weak = pin.as_weak();
                             pin.on_close_requested(move || {
                                 if let Some(pin) = pin_weak.upgrade() {
@@ -323,48 +372,54 @@ impl Controller {
 }
 
 fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
-    let (rect, editing, tool, image, size) = match controller.session.state() {
-        CaptureSessionState::Selecting(selection) => (
-            selection.rect,
-            false,
-            "pen",
-            image_from_frame(&controller.frame),
-            (controller.frame.width, controller.frame.height),
-        ),
-        CaptureSessionState::Editing(editor) => {
-            let mut document = editor.document.clone();
-            if let Some(preview) = editor.active_preview() {
-                document.annotations.push(preview);
-            }
-            let image = flatten(&document)
-                .map(|rendered| image_from_rgba(rendered.width, rendered.height, &rendered.pixels))
-                .unwrap_or_else(|_| image_from_frame(&controller.frame));
-            (
-                PhysicalRect::new(PhysicalPoint::ZERO, editor.document.crop.size),
-                true,
-                editor.selected_tool.id(),
-                image,
-                (
-                    editor.document.crop.size.width,
-                    editor.document.crop.size.height,
-                ),
-            )
+    match controller.session.state() {
+        CaptureSessionState::Selecting(_) => {
+            ui.set_frame_image(image_from_frame(&controller.frame));
+            sync_window_geometry(ui, controller, controller.frame.bounds());
         }
-        _ => (
-            PhysicalRect::default(),
-            false,
-            "pen",
-            image_from_frame(&controller.frame),
-            (controller.frame.width, controller.frame.height),
-        ),
+        CaptureSessionState::Editing(editor) => {
+            refresh_editor_image(ui, controller);
+            sync_window_geometry(ui, controller, editor.document.crop);
+        }
+        CaptureSessionState::Idle | CaptureSessionState::Preparing => {
+            ui.set_frame_image(image_from_frame(&controller.frame));
+            sync_window_geometry(ui, controller, controller.frame.bounds());
+        }
+    }
+    refresh_selection_ui(ui, controller);
+}
+
+fn refresh_editor_image(ui: &CaptureWindow, controller: &Controller) {
+    let CaptureSessionState::Editing(editor) = controller.session.state() else {
+        return;
     };
-    let origin = match controller.session.state() {
-        CaptureSessionState::Editing(_) => PhysicalPoint::ZERO,
-        _ => controller.frame.origin,
-    };
-    ui.window()
-        .set_size(slint::PhysicalSize::new(size.0, size.1));
+    let mut document = editor.document.clone();
+    if let Some(preview) = editor.active_preview() {
+        document.annotations.push(preview);
+    }
+    let image = flatten(&document)
+        .map(|rendered| image_from_rgba(rendered.width, rendered.height, &rendered.pixels))
+        .unwrap_or_else(|_| image_from_frame(&controller.frame));
     ui.set_frame_image(image);
+}
+
+fn refresh_selection_ui(ui: &CaptureWindow, controller: &Controller) {
+    let (rect, editing, tool) = match controller.session.state() {
+        CaptureSessionState::Selecting(selection) => (selection.rect, false, "pen"),
+        CaptureSessionState::Editing(editor) => (
+            PhysicalRect::new(PhysicalPoint::ZERO, editor.document.crop.size),
+            true,
+            editor.selected_tool.id(),
+        ),
+        CaptureSessionState::Idle | CaptureSessionState::Preparing => {
+            (PhysicalRect::default(), false, "pen")
+        }
+    };
+    let origin = if editing {
+        PhysicalPoint::ZERO
+    } else {
+        controller.frame.origin
+    };
     let scale = controller.scale_factor as f32;
     ui.set_selection_x((rect.origin.x - origin.x) as f32 / scale);
     ui.set_selection_y((rect.origin.y - origin.y) as f32 / scale);
@@ -374,6 +429,17 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
     ui.set_editing(editing);
     ui.set_active_tool(tool.into());
     ui.set_status(controller.status.clone().into());
+}
+
+fn sync_window_geometry(ui: &CaptureWindow, _controller: &Controller, bounds: PhysicalRect) {
+    let size = slint::PhysicalSize::new(bounds.size.width, bounds.size.height);
+    if ui.window().size() != size {
+        ui.window().set_size(size);
+    }
+    let position = slint::PhysicalPosition::new(bounds.origin.x, bounds.origin.y);
+    if ui.window().position() != position {
+        ui.window().set_position(position);
+    }
 }
 
 fn image_from_frame(frame: &CapturedFrame) -> Image {

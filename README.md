@@ -51,6 +51,8 @@ verification, known limitations, and frontend integration contract.
 it consumes the same Core crates and platform adapters as the CLI. The QML
 frontend remains a separate evaluation target and is not included yet. On a
 desktop Linux session, `cargo run -p capture-slint` uses the XDG ScreenCast
-portal/PipeWire path on native Wayland; `CAPTURE_MONITOR=N` selects a monitor.
+portal/PipeWire path on native Wayland. By default the frontend captures the
+virtual desktop; set `CAPTURE_MONITOR=N` to force one monitor for isolated
+testing.
 If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 `docs/CORE_CHANGE_REQUEST_TEMPLATE.md`) instead of forking the Core.
