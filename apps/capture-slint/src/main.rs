@@ -152,6 +152,7 @@ struct Controller {
     log: TraceLog,
     scale_factor: f64,
     status: String,
+    status_revision: i32,
     pin_window: Option<PinWindow>,
     last_snap_at: Option<Instant>,
     last_visual_at: Option<Instant>,
@@ -199,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ordinal = std::env::var("CAPTURE_MONITOR")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
-    let (frame, _capture_scale_factor, status) = if let Some(ordinal) = ordinal {
+    let (frame, _capture_scale_factor) = if let Some(ordinal) = ordinal {
         let monitors_started = Instant::now();
         let monitors = host.capture().monitors()?;
         log.duration("startup.monitors", monitors_started);
@@ -225,16 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rgba_started = Instant::now();
         let frame = Arc::new(captured.to_rgba8()?);
         log.duration("startup.frame_to_rgba8", rgba_started);
-        (
-            frame,
-            monitor.scale_factor.get().max(0.1),
-            format!(
-                "{}  {}x{}",
-                monitor.name,
-                monitor.bounds.width(),
-                monitor.bounds.height()
-            ),
-        )
+        (frame, monitor.scale_factor.get().max(0.1))
     } else {
         let capture_started = Instant::now();
         let captured = host.capture().capture_virtual_desktop()?;
@@ -242,11 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rgba_started = Instant::now();
         let frame = Arc::new(captured.to_rgba8()?);
         log.duration("startup.frame_to_rgba8", rgba_started);
-        (
-            frame.clone(),
-            1.0,
-            format!("Virtual desktop  {}x{}", frame.width, frame.height),
-        )
+        (frame.clone(), 1.0)
     };
     log.event(
         "startup.frame_ready",
@@ -315,7 +303,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame: frame.clone(),
         log: log.clone(),
         scale_factor: ui_scale_hint,
-        status,
+        status: String::new(),
+        status_revision: 0,
         pin_window: None,
         last_snap_at: None,
         last_visual_at: None,
@@ -476,7 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     snap_started.elapsed().as_secs_f64() * 1000.0
                                 ),
                             );
-                            controller.status = format!("Snap unavailable: {error}");
+                            controller.set_status(format!("无法吸附：{error}"));
                         }
                     }
                 }
@@ -795,9 +784,14 @@ impl Controller {
     fn apply(&mut self, command: CaptureCommand) {
         for event in self.session.apply(command) {
             if let CaptureEvent::Error(error) = event {
-                self.status = error.to_string();
+                self.set_status(error.to_string());
             }
         }
+    }
+
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.status_revision = self.status_revision.wrapping_add(1);
     }
 
     fn should_query_snap(&mut self) -> bool {
@@ -866,11 +860,11 @@ impl Controller {
                 };
                 match CopyAction.invoke(&document) {
                     Ok(ActionOutcome::Png(_)) => match copy_document_to_clipboard(&document) {
-                        Ok(()) => self.status = "Copied capture to the clipboard".to_string(),
-                        Err(error) => self.status = format!("Copy failed: {error}"),
+                        Ok(()) => self.set_status("已复制到剪贴板"),
+                        Err(error) => self.set_status(format!("复制失败：{error}")),
                     },
-                    Ok(_) => self.status = "Copy action returned an unexpected result".to_string(),
-                    Err(error) => self.status = format!("Copy failed: {error}"),
+                    Ok(_) => self.set_status("复制失败：返回了未知结果"),
+                    Err(error) => self.set_status(format!("复制失败：{error}")),
                 }
             }
             "save" => {
@@ -880,10 +874,10 @@ impl Controller {
                 let path = PathBuf::from("capture-slint.png");
                 match SaveAction::new(&path).invoke(&document) {
                     Ok(ActionOutcome::Saved(path)) => {
-                        self.status = format!("Saved {}", path.display())
+                        self.set_status(format!("已保存到 {}", path.display()))
                     }
-                    Ok(_) => self.status = "Save completed".to_string(),
-                    Err(error) => self.status = format!("Save failed: {error}"),
+                    Ok(_) => self.set_status("保存完成"),
+                    Err(error) => self.set_status(format!("保存失败：{error}")),
                 }
             }
             "pin" => {
@@ -896,7 +890,7 @@ impl Controller {
                             let rendered = match flatten(&document) {
                                 Ok(rendered) => rendered,
                                 Err(error) => {
-                                    self.status = format!("Pin render failed: {error}");
+                                    self.set_status(format!("固定截图渲染失败：{error}"));
                                     return refresh_editor_ui(ui, self, false);
                                 }
                             };
@@ -919,15 +913,15 @@ impl Controller {
                             });
                             let _ = pin.show();
                             self.pin_window = Some(pin);
-                            self.status = "Pinned capture in a floating window".to_string();
+                            self.set_status("截图已固定为浮动窗口");
                         }
-                        Err(error) => self.status = format!("Pin window failed: {error}"),
+                        Err(error) => self.set_status(format!("固定窗口创建失败：{error}")),
                     },
-                    Ok(_) => self.status = "Pin completed".to_string(),
-                    Err(error) => self.status = format!("Pin failed: {error}"),
+                    Ok(_) => self.set_status("固定完成"),
+                    Err(error) => self.set_status(format!("固定失败：{error}")),
                 }
             }
-            "ask-ai" => self.status = "Ask AI payload prepared (stub)".to_string(),
+            "ask-ai" => self.set_status("AI 功能尚未接入"),
             _ => {}
         }
         if matches!(self.session.state(), CaptureSessionState::Editing(_)) {
@@ -1124,6 +1118,7 @@ fn refresh_selection_geometry(ui: &CaptureWindow, controller: &Controller) {
         ui.set_toolbar_inside(false);
     }
     ui.set_status(controller.status.clone().into());
+    ui.set_status_revision(controller.status_revision);
 }
 
 fn annotation_path(
@@ -1200,8 +1195,8 @@ fn editor_layout(controller: &Controller) -> Option<EditorLayout> {
         })
         .unwrap_or(frame_bounds);
     let toolbar_size = PhysicalSize::new(
-        (548.0 * controller.scale_factor).round().max(1.0) as u32,
-        (64.0 * controller.scale_factor).round().max(1.0) as u32,
+        (408.0 * controller.scale_factor).round().max(1.0) as u32,
+        (56.0 * controller.scale_factor).round().max(1.0) as u32,
     );
     let placement = place_toolbar(selection, toolbar_size, work_area, 12);
     let (toolbar_rect, toolbar_reason) = if let Some(origin) = controller.toolbar_override {

@@ -1,3 +1,91 @@
+component ToolbarGlyph inherits Rectangle {
+    in property <string> kind;
+    in property <color> glyph-color;
+    width: 20px;
+    height: 20px;
+    background: transparent;
+
+    if kind == "pointer": Path {
+        x: 2px; y: 1px; width: 16px; height: 18px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 22;
+        commands: "M 2 1 L 18 10 L 11 11 L 15 19 L 12 21 L 8 13 L 4 17 Z";
+        fill: root.glyph-color; stroke: root.glyph-color; stroke-width: 1px;
+    }
+    if kind == "pen": Path {
+        x: 1px; y: 1px; width: 18px; height: 18px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 3 14 L 4 17 L 7 18 L 17 8 L 12 3 Z M 11 4 L 16 9 M 3 14 L 8 9";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.8px;
+    }
+    if kind == "rectangle": Path {
+        x: 2px; y: 2px; width: 16px; height: 16px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 3 3 L 17 3 L 17 17 L 3 17 Z";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.8px;
+    }
+    if kind == "undo": Path {
+        x: 1px; y: 2px; width: 18px; height: 16px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 7 5 L 3 9 L 7 13 M 4 9 L 11 9 C 15 9 17 11 17 15";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.8px;
+    }
+    if kind == "copy": Path {
+        x: 1px; y: 1px; width: 18px; height: 18px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 7 6 L 17 6 L 17 17 L 7 17 Z M 3 14 L 3 3 L 14 3";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.8px;
+    }
+    if kind == "save": Path {
+        x: 1px; y: 1px; width: 18px; height: 18px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 3 2 L 16 2 L 18 4 L 18 18 L 2 18 L 2 2 Z M 5 2 L 5 8 L 14 8 L 14 2 M 6 12 L 14 12 L 14 17 L 6 17 Z";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.6px;
+    }
+    if kind == "pin": Path {
+        x: 2px; y: 1px; width: 16px; height: 18px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 6 2 L 14 2 L 13 7 L 16 10 L 11 11 L 10 18 L 9 18 L 8 11 L 3 10 L 6 7 Z";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.6px;
+    }
+    if kind == "ask-ai": Path {
+        x: 1px; y: 1px; width: 18px; height: 18px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 10 2 L 11.5 7.5 L 17 9 L 11.5 10.5 L 10 16 L 8.5 10.5 L 3 9 L 8.5 7.5 Z M 16 13 L 16.7 15.3 L 19 16 L 16.7 16.7 L 16 19 L 15.3 16.7 L 13 16 L 15.3 15.3 Z";
+        fill: root.glyph-color; stroke: root.glyph-color; stroke-width: 0.8px;
+    }
+    if kind == "close": Path {
+        x: 2px; y: 2px; width: 16px; height: 16px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 20; viewbox-height: 20;
+        commands: "M 4 4 L 16 16 M 16 4 L 4 16";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 2px;
+    }
+}
+
+component ToolbarButton inherits Rectangle {
+    in property <string> icon-kind;
+    in property <string> tooltip-text;
+    in property <bool> selected;
+    callback activated;
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: root.selected ? #dbeafe : touch-area.has-hover ? #f1f5f9 : transparent;
+    border-width: root.selected ? 1px : 0px;
+    border-color: #93c5fd;
+
+    touch-area := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+        Tooltip { text: @markdown("\{root.tooltip-text}"); }
+    }
+    ToolbarGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        kind: root.icon-kind;
+        glyph-color: root.selected ? #1d4ed8 : #334155;
+    }
+}
+
 export component CaptureWindow inherits Window {
     in property <image> frame-image;
     in property <float> selection-x;
@@ -17,6 +105,8 @@ export component CaptureWindow inherits Window {
     in property <bool> toolbar-inside;
     in property <string> canvas-cursor-kind;
     in property <string> toolbar-cursor-kind;
+    in property <int> status-revision;
+    private property <bool> toast-visible;
 
     callback pointer-down(float, float);
     callback pointer-move(float, float);
@@ -26,6 +116,22 @@ export component CaptureWindow inherits Window {
     callback toolbar-pointer-down(float, float);
     callback toolbar-pointer-move(float, float);
     callback toolbar-pointer-up();
+
+    changed status-revision => {
+        if (root.status != "") {
+            root.toast-visible = true;
+            toast-timer.restart();
+        }
+    }
+
+    toast-timer := Timer {
+        interval: 2400ms;
+        running: false;
+        triggered() => {
+            root.toast-visible = false;
+            self.stop();
+        }
+    }
 
     no-frame: true;
     always-on-top: true;
@@ -124,18 +230,23 @@ export component CaptureWindow inherits Window {
             visible: root.toolbar-visible;
             x: root.toolbar-x * 1px;
             y: root.toolbar-y * 1px;
-            width: 548px;
-            height: 64px;
-            border-radius: 8px;
-            background: #1b222b;
+            width: 408px;
+            height: 56px;
+            border-radius: 12px;
+            background: #ffffff;
             border-width: 1px;
-            border-color: #455161;
+            border-color: #d5dce5;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000026;
 
             Rectangle {
+                x: 0px;
                 y: 0px;
-                width: parent.width;
-                height: 16px;
-                background: root.toolbar-inside ? #263747 : #202a34;
+                width: 36px;
+                height: parent.height;
+                border-radius: 12px;
+                background: root.toolbar-inside ? #f0f7ff : #f8fafc;
                 TouchArea {
                     mouse-cursor: root.toolbar-cursor-kind == "grabbing" ? grabbing : grab;
                     pointer-event(event) => {
@@ -145,105 +256,122 @@ export component CaptureWindow inherits Window {
                         if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
                             root.toolbar-pointer-up();
                         }
+                        if (event.kind == PointerEventKind.move && self.pressed) {
+                            root.toolbar-pointer-move(self.mouse-x / 1px + root.toolbar-x, self.mouse-y / 1px + root.toolbar-y);
+                        }
                     }
-                    moved => {
-                        root.toolbar-pointer-move(self.mouse-x / 1px + root.toolbar-x, self.mouse-y / 1px + root.toolbar-y);
-                    }
+                    Tooltip { text: @markdown("拖动工具栏"); }
+                }
+                for dot in [
+                    { x: 13px, y: 17px }, { x: 21px, y: 17px },
+                    { x: 13px, y: 25px }, { x: 21px, y: 25px },
+                    { x: 13px, y: 33px }, { x: 21px, y: 33px }
+                ] : Rectangle {
+                    x: dot.x;
+                    y: dot.y;
+                    width: 3px;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: #94a3b8;
                 }
             }
 
             HorizontalLayout {
-                y: 16px;
-                height: 48px;
-                padding-left: 8px;
-                padding-right: 8px;
-                spacing: 6px;
+                x: 42px;
+                y: 10px;
+                height: 36px;
+                spacing: 4px;
 
-                Rectangle {
-                    width: 56px;
-                    height: 40px;
-                    border-radius: 6px;
-                    background: root.active-tool == "pointer" ? #284b64 : #222b35;
-                    TouchArea { clicked => { root.choose-tool("pointer"); } }
-                    Text { text: "Pointer"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "pointer";
+                    tooltip-text: "指针工具";
+                    selected: root.active-tool == "pointer";
+                    activated => { root.choose-tool("pointer"); }
                 }
-
-                Rectangle {
-                    width: 44px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: root.active-tool == "pen" ? #284b64 : #222b35;
-                    TouchArea { clicked => { root.choose-tool("pen"); } }
-                    Text { text: "Pen"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "pen";
+                    tooltip-text: "画笔工具";
+                    selected: root.active-tool == "pen";
+                    activated => { root.choose-tool("pen"); }
                 }
-                Rectangle {
-                    width: 64px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: root.active-tool == "rectangle" ? #284b64 : #222b35;
-                    TouchArea { clicked => { root.choose-tool("rectangle"); } }
-                    Text { text: "Rect"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "rectangle";
+                    tooltip-text: "矩形工具";
+                    selected: root.active-tool == "rectangle";
+                    activated => { root.choose-tool("rectangle"); }
                 }
-                Rectangle {
-                    width: 56px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: #222b35;
-                    TouchArea { clicked => { root.run-action("undo"); } }
-                    Text { text: "Undo"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "undo";
+                    tooltip-text: "撤销";
+                    activated => { root.run-action("undo"); }
                 }
-                Rectangle {
-                    width: 62px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: #70d6ff;
-                    TouchArea { clicked => { root.run-action("copy"); } }
-                    Text { text: "Copy"; color: #0c1a23; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "copy";
+                    tooltip-text: "复制截图";
+                    activated => { root.run-action("copy"); }
                 }
-                Rectangle {
-                    width: 62px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: #222b35;
-                    TouchArea { clicked => { root.run-action("save"); } }
-                    Text { text: "Save"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "save";
+                    tooltip-text: "保存截图";
+                    activated => { root.run-action("save"); }
                 }
-                Rectangle {
-                    width: 62px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: #222b35;
-                    TouchArea { clicked => { root.run-action("pin"); } }
-                    Text { text: "Pin"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "pin";
+                    tooltip-text: "固定截图";
+                    activated => { root.run-action("pin"); }
                 }
-                Rectangle {
-                    width: 62px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: #222b35;
-                    TouchArea { clicked => { root.run-action("ask-ai"); } }
-                    Text { text: "Ask AI"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "ask-ai";
+                    tooltip-text: "询问 AI";
+                    activated => { root.run-action("ask-ai"); }
                 }
-                Rectangle {
-                    width: 62px;
-                    height: 40px;
-                    border-radius: 8px;
-                    background: #222b35;
-                    TouchArea { clicked => { root.run-action("cancel"); } }
-                    Text { text: "Close"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                ToolbarButton {
+                    icon-kind: "close";
+                    tooltip-text: "关闭";
+                    activated => { root.run-action("cancel"); }
                 }
             }
         }
 
-        Rectangle {
-            visible: root.status != "";
-            x: 16px;
-            y: parent.height - self.height - 16px;
-            width: min(parent.width - 32px, 720px);
-            height: 34px;
-            border-radius: 8px;
-            background: #1b222bdd;
-            Text { text: root.status; color: #d8e4ee; x: 12px; y: 7px; }
+        toast := Rectangle {
+            visible: root.toast-visible && root.status != "";
+            width: min(max(toast-text.preferred-width + 32px, 128px), 440px);
+            height: 36px;
+            x: root.toolbar-visible
+                ? max(12px, min(parent.width - self.width - 12px, root.toolbar-x * 1px + 204px - self.width / 2))
+                : (parent.width - self.width) / 2;
+            y: root.toolbar-visible
+                ? (root.toolbar-y * 1px >= 52px
+                    ? root.toolbar-y * 1px - self.height - 8px
+                    : min(parent.height - self.height - 12px, root.toolbar-y * 1px + 64px))
+                : parent.height - self.height - 24px;
+            border-radius: 9px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #d5dce5;
+            drop-shadow-offset-y: 3px;
+            drop-shadow-blur: 10px;
+            drop-shadow-color: #00000024;
+
+            Rectangle {
+                x: 12px;
+                y: (parent.height - self.height) / 2;
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: #3b82f6;
+            }
+            toast-text := Text {
+                x: 27px;
+                y: 0px;
+                width: parent.width - 37px;
+                height: parent.height;
+                text: root.status;
+                color: #334155;
+                font-size: 13px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
         }
     }
 }
