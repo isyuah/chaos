@@ -28,7 +28,7 @@ jobs:
 
       - name: Install Linux native capture dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev libpipewire-0.3-dev
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libpipewire-0.3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libfontconfig1-dev libssl-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check

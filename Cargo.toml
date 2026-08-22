@@ -9,12 +9,12 @@ members = [
     "crates/capture-windows",
     "crates/capture-linux",
     "tools/capture-cli",
+    "apps/capture-slint",
 ]
 
-# The UI experiment apps (apps/capture-slint, apps/capture-qml) are created by
-# their own agents and are intentionally NOT members here yet. They build against
-# the frozen Core API described in CORE_BASELINE_REPORT.md. When a UI agent adds
-# its app, it appends its package path to this member list and runs `cargo build`.
+# The shared Core crates remain toolkit-free; UI experiment apps live under
+# apps/ and are added to this workspace when their frontend integration is
+# ready for evaluation.
 
 [workspace.package]
 version = "0.1.0"

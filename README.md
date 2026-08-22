@@ -47,7 +47,10 @@ verification, known limitations, and frontend integration contract.
 
 ## Frontend note
 
-`apps/capture-slint` and `apps/capture-qml` are **not** workspace members yet;
-their agents add them to the `[workspace] members` list and depend on the Core
-crates. If the Core API blocks a frontend, file a `CORE_CHANGE_REQUEST.md` (see
+`apps/capture-slint` is the working Slint frontend and is part of the workspace;
+it consumes the same Core crates and platform adapters as the CLI. The QML
+frontend remains a separate evaluation target and is not included yet. On a
+desktop Linux session, `cargo run -p capture-slint` uses the XDG ScreenCast
+portal/PipeWire path on native Wayland; `CAPTURE_MONITOR=N` selects a monitor.
+If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 `docs/CORE_CHANGE_REQUEST_TEMPLATE.md`) instead of forking the Core.

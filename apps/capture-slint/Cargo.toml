@@ -1,0 +1,27 @@
+[package]
+name = "capture-slint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Slint frontend for the shared screenshot capture Core."
+
+[dependencies]
+capture-core.workspace = true
+capture-platform-api.workspace = true
+capture-annotation.workspace = true
+capture-render.workspace = true
+capture-actions.workspace = true
+capture-windows.workspace = true
+capture-linux.workspace = true
+slint = { version = "=1.8.0", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-software",
+] }
+arboard = "3"
+
+[build-dependencies]
+slint-build = "=1.8.0"

@@ -365,8 +365,9 @@ the two frontends will use.
 
 ## 12. How each UI frontend plugs into Core
 
-1. **Create the app package** (`apps/capture-slint` or `apps/capture-qml`), add
-   it to the workspace member list, and depend on `capture-core`,
+1. **Create or use the app package** (`apps/capture-slint` is implemented;
+   `apps/capture-qml` remains future work), add it to the workspace member list,
+   and depend on `capture-core`,
    `capture-platform-api`, `capture-annotation`, `capture-render`,
    `capture-actions`.
 2. **Select a platform** (one line, OS-conditional):
@@ -451,4 +452,5 @@ The current untagged working tree addresses the defects found during review:
 
 The remaining deliberate boundaries are GDI's protected-content limitation,
 Wayland's lack of a portable global window-list/overlay protocol, and the
-absence of the separate Slint/QML frontend applications in this workspace.
+absence of the separate QML frontend application. The Slint frontend is now a
+workspace member and is verified by the same workspace build/test gates.

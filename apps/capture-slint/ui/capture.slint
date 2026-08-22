@@ -1,0 +1,170 @@
+export component CaptureWindow inherits Window {
+    in property <image> frame-image;
+    in property <float> selection-x;
+    in property <float> selection-y;
+    in property <float> selection-width;
+    in property <float> selection-height;
+    in property <bool> selecting;
+    in property <bool> editing;
+    in property <string> status;
+    in property <string> active-tool;
+
+    callback pointer-down(float, float);
+    callback pointer-move(float, float);
+    callback pointer-up(float, float);
+    callback choose-tool(string);
+    callback run-action(string);
+
+    no-frame: true;
+    always-on-top: true;
+    background: #101318;
+
+    Rectangle {
+        background: #101318;
+
+        Image {
+            source: root.frame-image;
+            width: parent.width;
+            height: parent.height;
+            image-fit: contain;
+        }
+
+        Rectangle {
+            background: #07101880;
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            x: root.selection-x * 1px;
+            y: root.selection-y * 1px;
+            width: root.selection-width * 1px;
+            height: root.selection-height * 1px;
+            background: #00000008;
+            border-width: 2px;
+            border-color: root.editing ? #70d6ff : #ffffff;
+            visible: root.selection-width > 0 && root.selection-height > 0;
+        }
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
+                if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                    root.pointer-up(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
+            }
+            moved => { root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px); }
+        }
+
+        Rectangle {
+            visible: root.editing;
+            x: max(12px, min(parent.width - self.width - 12px, root.selection-x * 1px));
+            y: max(12px, min(parent.height - self.height - 12px, (root.selection-y + root.selection-height) * 1px + 12px));
+            width: 392px;
+            height: 56px;
+            border-radius: 12px;
+            background: #1b222b;
+            border-width: 1px;
+            border-color: #455161;
+
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 6px;
+
+                Rectangle {
+                    width: 44px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: root.active-tool == "pen" ? #284b64 : #222b35;
+                    TouchArea { clicked => { root.choose-tool("pen"); } }
+                    Text { text: "Pen"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 64px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: root.active-tool == "rectangle" ? #284b64 : #222b35;
+                    TouchArea { clicked => { root.choose-tool("rectangle"); } }
+                    Text { text: "Rect"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 56px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: #222b35;
+                    TouchArea { clicked => { root.run-action("undo"); } }
+                    Text { text: "Undo"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 62px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: #70d6ff;
+                    TouchArea { clicked => { root.run-action("copy"); } }
+                    Text { text: "Copy"; color: #0c1a23; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 62px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: #222b35;
+                    TouchArea { clicked => { root.run-action("save"); } }
+                    Text { text: "Save"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 62px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: #222b35;
+                    TouchArea { clicked => { root.run-action("pin"); } }
+                    Text { text: "Pin"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 62px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: #222b35;
+                    TouchArea { clicked => { root.run-action("ask-ai"); } }
+                    Text { text: "Ask AI"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 62px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: #222b35;
+                    TouchArea { clicked => { root.run-action("cancel"); } }
+                    Text { text: "Close"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+
+        Rectangle {
+            visible: root.status != "";
+            x: 16px;
+            y: parent.height - self.height - 16px;
+            width: min(parent.width - 32px, 720px);
+            height: 34px;
+            border-radius: 8px;
+            background: #1b222bdd;
+            Text { text: root.status; color: #d8e4ee; x: 12px; y: 7px; }
+        }
+    }
+}
+
+export component PinWindow inherits Window {
+    in property <image> pin-image;
+    callback close-requested();
+    no-frame: true;
+    always-on-top: true;
+    background: #0b1015;
+    Rectangle {
+        background: #0b1015;
+        Image { source: root.pin-image; width: parent.width; height: parent.height; image-fit: contain; }
+        TouchArea { clicked => { root.close-requested(); } }
+    }
+}
