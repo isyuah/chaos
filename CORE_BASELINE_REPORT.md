@@ -1,6 +1,6 @@
 # CORE_BASELINE_REPORT — capture-ui-eval shared Core (demo-core-v1)
 
-Frozen commit: `__FROZEN_COMMIT_HASH__`
+Frozen commit: `4de8ddd0e21a84ad2a9ec7030fa89d67acd4b9fd`
 Tag: `demo-core-v1`
 Build environment: Windows 11, `rustc 1.97.1` (`x86_64-pc-windows-msvc`), `cargo 1.97.1`
 
