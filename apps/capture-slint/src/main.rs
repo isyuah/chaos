@@ -236,10 +236,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_started = Instant::now();
     let ui = CaptureWindow::new()?;
     log.duration("startup.ui_created", ui_started);
-    let window_size_started = Instant::now();
-    ui.window()
-        .set_size(slint::PhysicalSize::new(frame.width, frame.height));
-    log.duration("startup.window_set_size", window_size_started);
     let state = Rc::new(RefCell::new(Controller {
         host,
         session: CaptureSession::new(),
@@ -269,7 +265,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         controller
             .log
             .duration("startup.session_frame_ready", session_frame_started);
-        refresh_ui(&ui, &controller);
+        let image_started = Instant::now();
+        ui.set_frame_image(image_from_frame(&controller.frame));
+        controller.log.duration("render.frame_image", image_started);
+        refresh_selection_geometry(&ui, &controller);
+        refresh_editor_overlay(&ui, &controller);
         controller
             .log
             .duration("startup.initial_ui_refresh", initial_refresh_started);
@@ -476,9 +476,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let show_started = Instant::now();
+    let bootstrap_show_started = Instant::now();
     ui.show()?;
-    log.duration("startup.ui_show", show_started);
+    log.duration("startup.window_bootstrap_show", bootstrap_show_started);
+    let bootstrap_hide_started = Instant::now();
+    ui.hide()?;
+    log.duration("startup.window_bootstrap_hide", bootstrap_hide_started);
     {
         let mut controller = state.borrow_mut();
         controller.scale_factor = ui.window().scale_factor() as f64;
@@ -495,6 +498,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
     }
+    let show_started = Instant::now();
+    ui.show()?;
+    log.duration("startup.ui_show", show_started);
     log.event("startup.event_loop.begin", "true");
     let event_loop_started = Instant::now();
     slint::run_event_loop()?;
