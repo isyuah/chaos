@@ -63,7 +63,9 @@ If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 `CAPTURE_SLINT_LOG` to also append the same events to a file. The log includes
 backend startup, monitor enumeration, capture and RGBA conversion, window
 creation, first pointer-down handling, snap queries, sampled pointer input, and
-visual refresh durations.
+visual refresh durations. Startup also records the initial window resize and
+session handoff; closing records cancel, hide, event-loop, and resource-drop
+durations.
 
 PowerShell example:
 

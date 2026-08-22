@@ -236,8 +236,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_started = Instant::now();
     let ui = CaptureWindow::new()?;
     log.duration("startup.ui_created", ui_started);
+    let window_size_started = Instant::now();
     ui.window()
         .set_size(slint::PhysicalSize::new(frame.width, frame.height));
+    log.duration("startup.window_set_size", window_size_started);
     let state = Rc::new(RefCell::new(Controller {
         host,
         session: CaptureSession::new(),
@@ -255,10 +257,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut controller = state.borrow_mut();
         let initial_refresh_started = Instant::now();
+        let session_begin_started = Instant::now();
         controller.session.apply(CaptureCommand::Begin);
+        controller
+            .log
+            .duration("startup.session_begin", session_begin_started);
+        let session_frame_started = Instant::now();
         controller
             .session
             .apply(CaptureCommand::FrameReady((*frame).clone()));
+        controller
+            .log
+            .duration("startup.session_frame_ready", session_frame_started);
         refresh_ui(&ui, &controller);
         controller
             .log
@@ -486,8 +496,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     log.event("startup.event_loop.begin", "true");
+    let event_loop_started = Instant::now();
     slint::run_event_loop()?;
     log.event("shutdown.event_loop.end", "true");
+    log.duration("shutdown.event_loop.total", event_loop_started);
+    let cleanup_started = Instant::now();
+    drop(ui);
+    drop(state);
+    log.duration("shutdown.resources_drop", cleanup_started);
     log.flush();
     Ok(())
 }
@@ -557,12 +573,39 @@ impl Controller {
     }
 
     fn run_action(&mut self, action: &str, ui: &CaptureWindow) {
+        self.log.event(
+            "action.begin",
+            format!(
+                "action={action} state={}",
+                state_label(self.session.state())
+            ),
+        );
         match action {
             "undo" => self.apply(CaptureCommand::Undo),
             "cancel" => {
+                let apply_started = Instant::now();
                 self.apply(CaptureCommand::Cancel);
-                let _ = ui.hide();
+                self.log.duration("shutdown.cancel.apply", apply_started);
+                let hide_started = Instant::now();
+                match ui.hide() {
+                    Ok(()) => self.log.event(
+                        "shutdown.cancel.hide",
+                        format!(
+                            "ok=true duration_ms={:.3}",
+                            hide_started.elapsed().as_secs_f64() * 1000.0
+                        ),
+                    ),
+                    Err(error) => self.log.event(
+                        "shutdown.cancel.hide",
+                        format!(
+                            "ok=false duration_ms={:.3} error={error}",
+                            hide_started.elapsed().as_secs_f64() * 1000.0
+                        ),
+                    ),
+                }
+                let quit_started = Instant::now();
                 let _ = slint::quit_event_loop();
+                self.log.duration("shutdown.cancel.quit", quit_started);
                 return;
             }
             "copy" => {
@@ -832,14 +875,34 @@ fn annotation_path(annotation: &Annotation, crop: PhysicalRect, scale: f32) -> (
     }
 }
 
-fn sync_window_geometry(ui: &CaptureWindow, _controller: &Controller, bounds: PhysicalRect) {
+fn sync_window_geometry(ui: &CaptureWindow, controller: &Controller, bounds: PhysicalRect) {
     let size = slint::PhysicalSize::new(bounds.size.width, bounds.size.height);
     if ui.window().size() != size {
+        let started = Instant::now();
         ui.window().set_size(size);
+        controller.log.event(
+            "window.set_size",
+            format!(
+                "width={} height={} duration_ms={:.3}",
+                size.width,
+                size.height,
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
     }
     let position = slint::PhysicalPosition::new(bounds.origin.x, bounds.origin.y);
     if ui.window().position() != position {
+        let started = Instant::now();
         ui.window().set_position(position);
+        controller.log.event(
+            "window.set_position",
+            format!(
+                "x={} y={} duration_ms={:.3}",
+                position.x,
+                position.y,
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
     }
 }
 
