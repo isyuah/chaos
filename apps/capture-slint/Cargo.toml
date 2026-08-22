@@ -19,7 +19,9 @@ slint = { version = "=1.8.0", default-features = false, features = [
     "std",
     "compat-1-2",
     "backend-winit",
+    "renderer-skia",
     "renderer-software",
+    "raw-window-handle-06",
 ] }
 arboard = "3"
 

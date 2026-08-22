@@ -3,7 +3,7 @@
 use arboard::{Clipboard, ImageData};
 use capture_actions::{ActionOutcome, CaptureAction, CopyAction, PinAction, SaveAction};
 use capture_annotation::{
-    AnnotationTool, CaptureCommand, CaptureEvent, CaptureSession, CaptureSessionState,
+    Annotation, AnnotationTool, CaptureCommand, CaptureEvent, CaptureSession, CaptureSessionState,
 };
 use capture_core::capture::CapturedFrame;
 use capture_core::geometry::{PhysicalPoint, PhysicalRect};
@@ -59,6 +59,7 @@ struct Controller {
     status: String,
     pin_window: Option<PinWindow>,
     last_snap_at: Option<Instant>,
+    last_visual_at: Option<Instant>,
 }
 
 fn make_host() -> Result<HostPlatform, String> {
@@ -116,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status,
         pin_window: None,
         last_snap_at: None,
+        last_visual_at: None,
     }));
 
     {
@@ -180,9 +182,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 controller.apply(CaptureCommand::UpdateFreeSelection(point));
             } else if matches!(controller.session.state(), CaptureSessionState::Editing(_)) {
                 controller.apply(CaptureCommand::UpdateAnnotation(point));
-                refresh_editor_image(&ui, &controller);
+                if controller.should_render_visuals() {
+                    refresh_editor_overlay(&ui, &controller);
+                }
             }
-            refresh_selection_ui(&ui, &controller);
+            if matches!(
+                controller.session.state(),
+                CaptureSessionState::Selecting(_)
+            ) && controller.should_render_visuals()
+            {
+                refresh_selection_geometry(&ui, &controller);
+            }
         });
     }
 
@@ -282,6 +292,18 @@ impl Controller {
         true
     }
 
+    fn should_render_visuals(&mut self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_visual_at
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(16))
+        {
+            return false;
+        }
+        self.last_visual_at = Some(now);
+        true
+    }
+
     fn run_action(&mut self, action: &str, ui: &CaptureWindow) {
         match action {
             "undo" => self.apply(CaptureCommand::Undo),
@@ -378,7 +400,7 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
             sync_window_geometry(ui, controller, controller.frame.bounds());
         }
         CaptureSessionState::Editing(editor) => {
-            refresh_editor_image(ui, controller);
+            refresh_editor_base(ui, controller);
             sync_window_geometry(ui, controller, editor.document.crop);
         }
         CaptureSessionState::Idle | CaptureSessionState::Preparing => {
@@ -386,24 +408,41 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
             sync_window_geometry(ui, controller, controller.frame.bounds());
         }
     }
-    refresh_selection_ui(ui, controller);
+    refresh_selection_geometry(ui, controller);
+    refresh_editor_overlay(ui, controller);
 }
 
-fn refresh_editor_image(ui: &CaptureWindow, controller: &Controller) {
+fn refresh_editor_base(ui: &CaptureWindow, controller: &Controller) {
     let CaptureSessionState::Editing(editor) = controller.session.state() else {
         return;
     };
-    let mut document = editor.document.clone();
-    if let Some(preview) = editor.active_preview() {
-        document.annotations.push(preview);
-    }
-    let image = flatten(&document)
+    let image = flatten(&editor.document)
         .map(|rendered| image_from_rgba(rendered.width, rendered.height, &rendered.pixels))
         .unwrap_or_else(|_| image_from_frame(&controller.frame));
     ui.set_frame_image(image);
 }
 
-fn refresh_selection_ui(ui: &CaptureWindow, controller: &Controller) {
+fn refresh_editor_overlay(ui: &CaptureWindow, controller: &Controller) {
+    let (path, width, visible) = match controller.session.state() {
+        CaptureSessionState::Editing(editor) => editor
+            .active_preview()
+            .map(|annotation| {
+                annotation_path(
+                    annotation,
+                    editor.document.crop,
+                    controller.scale_factor as f32,
+                )
+            })
+            .map(|(path, width)| (path, width, true))
+            .unwrap_or_else(|| (String::new(), 0.0, false)),
+        _ => (String::new(), 0.0, false),
+    };
+    ui.set_annotation_path(path.into());
+    ui.set_annotation_width(width);
+    ui.set_annotation_visible(visible);
+}
+
+fn refresh_selection_geometry(ui: &CaptureWindow, controller: &Controller) {
     let (rect, editing, tool) = match controller.session.state() {
         CaptureSessionState::Selecting(selection) => (selection.rect, false, "pen"),
         CaptureSessionState::Editing(editor) => (
@@ -429,6 +468,43 @@ fn refresh_selection_ui(ui: &CaptureWindow, controller: &Controller) {
     ui.set_editing(editing);
     ui.set_active_tool(tool.into());
     ui.set_status(controller.status.clone().into());
+}
+
+fn annotation_path(annotation: Annotation, crop: PhysicalRect, scale: f32) -> (String, f32) {
+    let local = |point: PhysicalPoint| {
+        (
+            (point.x - crop.origin.x) as f32 / scale,
+            (point.y - crop.origin.y) as f32 / scale,
+        )
+    };
+    match annotation {
+        Annotation::Pen(stroke) => {
+            let mut path = String::new();
+            for (index, point) in stroke.points.iter().enumerate() {
+                let (x, y) = local(*point);
+                if index == 0 {
+                    path.push_str(&format!("M {} {} ", x, y));
+                } else {
+                    path.push_str(&format!("L {} {} ", x, y));
+                }
+            }
+            (path, stroke.thickness as f32 / scale)
+        }
+        Annotation::Rectangle(rectangle) => {
+            let (left, top) = local(rectangle.rect.origin);
+            let (right, bottom) = local(PhysicalPoint::new(
+                rectangle.rect.right(),
+                rectangle.rect.bottom(),
+            ));
+            (
+                format!(
+                    "M {} {} L {} {} L {} {} L {} {} Z",
+                    left, top, right, top, right, bottom, left, bottom
+                ),
+                rectangle.thickness as f32 / scale,
+            )
+        }
+    }
 }
 
 fn sync_window_geometry(ui: &CaptureWindow, _controller: &Controller, bounds: PhysicalRect) {

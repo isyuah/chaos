@@ -8,6 +8,9 @@ export component CaptureWindow inherits Window {
     in property <bool> editing;
     in property <string> status;
     in property <string> active-tool;
+    in property <string> annotation-path;
+    in property <float> annotation-width;
+    in property <bool> annotation-visible;
 
     callback pointer-down(float, float);
     callback pointer-move(float, float);
@@ -33,6 +36,23 @@ export component CaptureWindow inherits Window {
             background: #07101880;
             width: parent.width;
             height: parent.height;
+        }
+
+        Path {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: parent.width / 1px;
+            viewbox-height: parent.height / 1px;
+            commands: root.annotation-path;
+            stroke: #ff3b30;
+            stroke-width: root.annotation-width * 1px;
+            fill: #00000000;
+            clip: true;
+            visible: root.annotation-visible;
         }
 
         Rectangle {
