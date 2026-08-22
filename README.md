@@ -56,3 +56,26 @@ virtual desktop; set `CAPTURE_MONITOR=N` to force one monitor for isolated
 testing.
 If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 `docs/CORE_CHANGE_REQUEST_TEMPLATE.md`) instead of forking the Core.
+
+## Slint latency logging
+
+`capture-slint` records timestamped latency events to stderr. Set
+`CAPTURE_SLINT_LOG` to also append the same events to a file. The log includes
+backend startup, monitor enumeration, capture and RGBA conversion, window
+creation, first pointer-down handling, snap queries, sampled pointer input, and
+visual refresh durations.
+
+PowerShell example:
+
+```powershell
+$env:CAPTURE_SLINT_LOG = (Join-Path $pwd "capture-slint.log")
+$env:SLINT_BACKEND = "skia"
+cargo run -p capture-slint
+```
+
+For a smaller startup sample, set `$env:CAPTURE_MONITOR = "0"`; remove that
+variable to measure the default virtual-desktop capture. On Linux, use the
+equivalent `CAPTURE_SLINT_LOG=/tmp/capture-slint.log SLINT_BACKEND=skia`
+environment variables. Reproduce one selection and one pen stroke, then
+inspect the `startup.*`, `input.down.*`, `snap.*`, `visual.*`, and
+`render.*` entries.
