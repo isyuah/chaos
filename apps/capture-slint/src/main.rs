@@ -265,9 +265,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         controller
             .log
             .duration("startup.session_frame_ready", session_frame_started);
-        let image_started = Instant::now();
-        ui.set_frame_image(image_from_frame(&controller.frame));
-        controller.log.duration("render.frame_image", image_started);
         refresh_selection_geometry(&ui, &controller);
         refresh_editor_overlay(&ui, &controller);
         controller
@@ -476,18 +473,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let bootstrap_show_started = Instant::now();
+    let show_started = Instant::now();
     ui.show()?;
-    log.duration("startup.window_bootstrap_show", bootstrap_show_started);
-    let bootstrap_hide_started = Instant::now();
-    ui.hide()?;
-    log.duration("startup.window_bootstrap_hide", bootstrap_hide_started);
+    log.duration("startup.ui_show", show_started);
     {
         let mut controller = state.borrow_mut();
         controller.scale_factor = ui.window().scale_factor() as f64;
         sync_window_geometry(&ui, &controller, controller.frame.bounds());
+        let image_started = Instant::now();
+        ui.set_frame_image(image_from_frame(&controller.frame));
+        controller.log.duration("render.frame_image", image_started);
+        ui.set_ready(true);
         controller.log.event(
-            "startup.window_ready",
+            "startup.overlay_ready",
             format!(
                 "scale_factor={:.3} position=({}, {}) size={}x{}",
                 controller.scale_factor,
@@ -498,9 +496,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         );
     }
-    let show_started = Instant::now();
-    ui.show()?;
-    log.duration("startup.ui_show", show_started);
     log.event("startup.event_loop.begin", "true");
     let event_loop_started = Instant::now();
     slint::run_event_loop()?;

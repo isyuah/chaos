@@ -1,4 +1,5 @@
 export component CaptureWindow inherits Window {
+    in property <bool> ready;
     in property <image> frame-image;
     in property <float> selection-x;
     in property <float> selection-y;
@@ -23,6 +24,7 @@ export component CaptureWindow inherits Window {
     background: #101318;
 
     Rectangle {
+        visible: root.ready;
         background: #101318;
 
         Image {
