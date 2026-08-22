@@ -405,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if controller
                 .last_move_log_at
-                .map_or(true, |last| last.elapsed() >= Duration::from_millis(500))
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(500))
             {
                 controller.last_move_log_at = Some(Instant::now());
                 controller.log.event(

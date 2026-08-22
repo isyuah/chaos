@@ -15,7 +15,7 @@ capture-render.workspace = true
 capture-actions.workspace = true
 capture-windows.workspace = true
 capture-linux.workspace = true
-slint = { version = "=1.8.0", default-features = false, features = [
+slint = { version = "=1.17.1", default-features = false, features = [
     "std",
     "compat-1-2",
     "backend-winit",
@@ -26,4 +26,4 @@ slint = { version = "=1.8.0", default-features = false, features = [
 arboard = "3"
 
 [build-dependencies]
-slint-build = "=1.8.0"
+slint-build = "=1.17.1"
