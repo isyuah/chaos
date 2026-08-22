@@ -4,6 +4,7 @@ use crate::capture::WindowsCaptureBackend;
 use crate::snap::WindowsSnapBackend;
 use capture_core::CaptureError;
 use capture_platform_api::{CaptureBackend, SnapBackend};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -26,6 +27,9 @@ impl WindowsPlatform {
         // manifest/startup path for physical-pixel coordinates.
         let _ =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // UI Automation is a COM API. Initialize the UI thread once; repeated
+        // initialization is harmless when the frontend already initialized it.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         Ok(Self {
             capture: WindowsCaptureBackend::new(),
             snap: WindowsSnapBackend::new(),

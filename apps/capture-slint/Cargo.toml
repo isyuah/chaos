@@ -24,6 +24,7 @@ slint = { version = "=1.17.1", default-features = false, features = [
     "raw-window-handle-06",
 ] }
 arboard = "3"
+raw-window-handle = "0.6"
 
 [build-dependencies]
 slint-build = "=1.17.1"

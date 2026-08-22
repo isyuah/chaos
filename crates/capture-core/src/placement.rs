@@ -33,8 +33,8 @@ pub struct ToolbarPlacement {
 ///
 /// Strategy:
 /// 1. below the selection;
-/// 2. if below does not fit in `work_area`, above;
-/// 3. if above does not fit, inside the selection near its bottom;
+/// 2. if below does not fit in `work_area`, inside the selection near its bottom;
+/// 3. if the selection is too small for an inside toolbar, above;
 /// 4. otherwise clamp the best-effort rect into `work_area`.
 ///
 /// The rect is horizontally centered on the selection and clamped so it stays
@@ -83,10 +83,10 @@ pub fn place_toolbar(
 
     let (mut rect, reason) = if fits(below) {
         (below, ToolbarPlacementReason::Below)
-    } else if fits(above) {
-        (above, ToolbarPlacementReason::Above)
     } else if fits(inside) {
         (inside, ToolbarPlacementReason::InsideBottom)
+    } else if fits(above) {
+        (above, ToolbarPlacementReason::Above)
     } else {
         // No strategy fits; start from below and clamp it into the work area.
         (below, ToolbarPlacementReason::Clamped)
@@ -143,11 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn above_when_selection_grazes_the_bottom() {
+    fn inside_when_selection_grazes_the_bottom() {
         let sel = r(400, 900, 800, 100);
         let p = place_toolbar(sel, s(320, 40), work(), 8);
-        assert_eq!(p.reason, ToolbarPlacementReason::Above);
-        assert_eq!(p.rect.bottom(), sel.top() - 8);
+        assert_eq!(p.reason, ToolbarPlacementReason::InsideBottom);
+        assert_eq!(p.rect.bottom(), sel.bottom() - 8);
     }
 
     #[test]

@@ -98,7 +98,7 @@ impl EditorSession {
     pub fn new(document: CaptureDocument) -> Self {
         Self {
             document,
-            selected_tool: AnnotationTool::Pen,
+            selected_tool: AnnotationTool::Pointer,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active: None,
@@ -154,11 +154,12 @@ impl EditorSession {
     }
 
     pub fn begin_annotation(&mut self, point: PhysicalPoint) {
-        if self.document.crop.is_empty() {
+        if self.document.crop.is_empty() || self.selected_tool == AnnotationTool::Pointer {
             return;
         }
         let point = self.document.crop.clamp_point(point);
         self.active = Some(match self.selected_tool {
+            AnnotationTool::Pointer => return,
             AnnotationTool::Pen => ActiveAnnotation::Pen {
                 points: vec![point],
                 color: DEFAULT_PEN_COLOR,
@@ -850,6 +851,7 @@ mod tests {
                 CaptureCommand::BeginFreeSelection(PhysicalPoint::new(20, 20)),
                 CaptureCommand::UpdateFreeSelection(PhysicalPoint::new(60, 60)),
                 CaptureCommand::CommitSelection,
+                CaptureCommand::SelectTool(AnnotationTool::Pen),
                 CaptureCommand::BeginAnnotation(PhysicalPoint::new(0, 0)),
                 CaptureCommand::UpdateAnnotation(PhysicalPoint::new(100, 100)),
                 CaptureCommand::EndAnnotation,

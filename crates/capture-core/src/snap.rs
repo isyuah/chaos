@@ -5,6 +5,8 @@ use crate::geometry::{PhysicalPoint, PhysicalRect};
 /// The kind of a snap candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SnapKind {
+    /// A UI Automation element inside a top-level window.
+    Element,
     /// A top-level window.
     Window,
     /// A bounding region of the virtual desktop (fallback / catch-all).
@@ -87,8 +89,13 @@ pub fn rank_candidates(
     candidates.sort_by(|a, b| {
         let a_hit = a.bounds.contains_exclusive(point) as u8;
         let b_hit = b.bounds.contains_exclusive(point) as u8;
-        let a_kind = (a.kind == SnapKind::Window) as u8;
-        let b_kind = (b.kind == SnapKind::Window) as u8;
+        let kind_rank = |kind: SnapKind| match kind {
+            SnapKind::Element => 2,
+            SnapKind::Window => 1,
+            SnapKind::Desktop => 0,
+        };
+        let a_kind = kind_rank(a.kind);
+        let b_kind = kind_rank(b.kind);
         let a_area = a.bounds.area();
         let b_area = b.bounds.area();
         b_hit
@@ -152,6 +159,24 @@ mod tests {
         let window = win(0, 0, 100, 100, "w");
         let ranked = rank_candidates(point, vec![desktop, window.clone()]);
         assert_eq!(ranked[0].label, Some("w".to_string()));
+    }
+
+    #[test]
+    fn element_candidate_ranks_above_its_window() {
+        let point = PhysicalPoint::new(100, 100);
+        let element = SnapCandidate {
+            id: SnapCandidateId::new(2),
+            bounds: PhysicalRect::new(
+                PhysicalPoint::new(20, 20),
+                crate::geometry::PhysicalSize::new(160, 160),
+            ),
+            kind: SnapKind::Element,
+            label: Some("button".to_string()),
+            z_order: 0,
+        };
+        let window = win(0, 0, 300, 300, "window");
+        let ranked = rank_candidates(point, vec![window, element]);
+        assert_eq!(ranked[0].kind, SnapKind::Element);
     }
 
     #[test]

@@ -6,10 +6,15 @@ use capture_annotation::{
     Annotation, AnnotationTool, CaptureCommand, CaptureEvent, CaptureSession, CaptureSessionState,
 };
 use capture_core::capture::CapturedFrame;
-use capture_core::geometry::{PhysicalPoint, PhysicalRect};
-use capture_core::selection::SelectionInteraction;
+use capture_core::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
+use capture_core::selection::{ResizeHandle, SelectionInteraction, SelectionSession};
+use capture_core::{
+    place_toolbar, MonitorInfo, SnapCandidate, SnapExclusionToken, SnapKind, ToolbarPlacementReason,
+};
 use capture_platform_api::{CaptureBackend, SnapBackend};
 use capture_render::flatten;
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -104,6 +109,22 @@ enum HostPlatform {
     Linux(LinuxPlatform),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerGesture {
+    Select,
+    Annotate,
+    Move,
+    Resize(ResizeHandle),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EditorLayout {
+    window_bounds: PhysicalRect,
+    toolbar_rect: PhysicalRect,
+    work_area: PhysicalRect,
+    toolbar_reason: ToolbarPlacementReason,
+}
+
 impl HostPlatform {
     fn capture(&self) -> &dyn CaptureBackend {
         match self {
@@ -136,6 +157,13 @@ struct Controller {
     last_visual_at: Option<Instant>,
     pointer_moves: u64,
     last_move_log_at: Option<Instant>,
+    monitors: Vec<MonitorInfo>,
+    pointer_gesture: Option<PointerGesture>,
+    last_pointer: Option<PhysicalPoint>,
+    toolbar_override: Option<PhysicalPoint>,
+    toolbar_drag_offset: Option<PhysicalPoint>,
+    overlay_token: Option<SnapExclusionToken>,
+    last_toolbar_log_at: std::cell::Cell<Option<Instant>>,
 }
 
 fn make_host() -> Result<HostPlatform, String> {
@@ -171,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ordinal = std::env::var("CAPTURE_MONITOR")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
-    let (frame, scale_factor, status) = if let Some(ordinal) = ordinal {
+    let (frame, _capture_scale_factor, status) = if let Some(ordinal) = ordinal {
         let monitors_started = Instant::now();
         let monitors = host.capture().monitors()?;
         log.duration("startup.monitors", monitors_started);
@@ -233,25 +261,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
+    let monitors = match host.capture().monitors() {
+        Ok(monitors) => monitors,
+        Err(error) => {
+            log.event("startup.monitors.error", format!("error={error}"));
+            Vec::new()
+        }
+    };
+    for monitor in &monitors {
+        log.event(
+            "startup.monitor",
+            format!(
+                "name={} bounds={}x{}+{}+{} work_area={}x{}+{}+{} scale={:.3}",
+                monitor.name,
+                monitor.bounds.width(),
+                monitor.bounds.height(),
+                monitor.bounds.origin.x,
+                monitor.bounds.origin.y,
+                monitor.work_area.width(),
+                monitor.work_area.height(),
+                monitor.work_area.origin.x,
+                monitor.work_area.origin.y,
+                monitor.scale_factor.get(),
+            ),
+        );
+    }
+
     let ui_started = Instant::now();
     let ui = CaptureWindow::new()?;
     log.duration("startup.ui_created", ui_started);
+    let ui_scale_hint = std::env::var("SLINT_SCALE_FACTOR")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.1)
+        .unwrap_or(1.0);
+    if ui_scale_hint > 1.01 {
+        log.event(
+            "startup.ui_scale_hint",
+            format!("scale_factor={ui_scale_hint:.3}"),
+        );
+    }
     let window_size_started = Instant::now();
     ui.window()
         .set_size(slint::PhysicalSize::new(frame.width, frame.height));
     log.duration("startup.window_set_size", window_size_started);
+    let window_position_started = Instant::now();
+    ui.window()
+        .set_position(slint::PhysicalPosition::new(frame.origin.x, frame.origin.y));
+    log.duration("startup.window_set_position", window_position_started);
     let state = Rc::new(RefCell::new(Controller {
         host,
         session: CaptureSession::new(),
         frame: frame.clone(),
         log: log.clone(),
-        scale_factor,
+        scale_factor: ui_scale_hint,
         status,
         pin_window: None,
         last_snap_at: None,
         last_visual_at: None,
         pointer_moves: 0,
         last_move_log_at: None,
+        monitors,
+        pointer_gesture: None,
+        last_pointer: None,
+        toolbar_override: None,
+        toolbar_drag_offset: None,
+        overlay_token: None,
+        last_toolbar_log_at: std::cell::Cell::new(None),
     }));
 
     {
@@ -271,6 +347,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .duration("startup.session_frame_ready", session_frame_started);
         let image_started = Instant::now();
         ui.set_frame_image(image_from_frame(&controller.frame));
+        ui.set_canvas_cursor_kind("default".into());
+        ui.set_toolbar_cursor_kind("grab".into());
         controller.log.duration("render.frame_image", image_started);
         refresh_selection_geometry(&ui, &controller);
         refresh_editor_overlay(&ui, &controller);
@@ -289,42 +367,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut controller = state.borrow_mut();
             let point = controller.to_physical(x, y);
-            let command = match controller.session.state() {
-                CaptureSessionState::Selecting(selection)
-                    if selection.interaction == SelectionInteraction::Hovering
-                        && controller.session.hover_candidate().is_some() =>
-                {
-                    CaptureCommand::CommitSelection
-                }
-                CaptureSessionState::Selecting(_) => CaptureCommand::BeginFreeSelection(point),
-                CaptureSessionState::Editing(_) => CaptureCommand::BeginAnnotation(point),
-                _ => return,
-            };
-            let command_label = format!("{command:?}");
-            let refresh_kind = match &command {
-                CaptureCommand::BeginFreeSelection(_) => "selection",
-                CaptureCommand::BeginAnnotation(_) => "annotation",
-                _ => "full",
-            };
             let started = Instant::now();
             controller.log.event(
                 "input.down.begin",
                 format!(
-                    "x={x:.1} y={y:.1} physical=({}, {}) command={command_label}",
-                    point.x, point.y
+                    "x={x:.1} y={y:.1} physical=({}, {}) state={}",
+                    point.x,
+                    point.y,
+                    state_label(controller.session.state())
                 ),
             );
-            controller.apply(command);
+
+            controller.last_pointer = Some(point);
+            ui.set_canvas_cursor_kind(cursor_kind_for_point(&controller, point).into());
+            match controller.session.state() {
+                CaptureSessionState::Selecting(selection)
+                    if selection.interaction == SelectionInteraction::Hovering
+                        && controller
+                            .session
+                            .hover_candidate()
+                            .is_some_and(is_committable_snap) =>
+                {
+                    // Defer the commit until pointer-up so a drag over a
+                    // window still creates a free selection.
+                    controller.pointer_gesture = Some(PointerGesture::Select);
+                }
+                CaptureSessionState::Selecting(_) => {
+                    controller.pointer_gesture = Some(PointerGesture::Select);
+                    controller.apply(CaptureCommand::BeginFreeSelection(point));
+                }
+                CaptureSessionState::Editing(editor) => match editor.selected_tool {
+                    AnnotationTool::Pointer => {
+                        let crop = editor.document.crop;
+                        let mut selection = SelectionSession::new();
+                        selection.rect = crop;
+                        let handle =
+                            selection.hit_resize_handle(point, handle_tolerance(&controller));
+                        if let Some(handle) = handle {
+                            controller.pointer_gesture = Some(PointerGesture::Resize(handle));
+                        } else if editor.document.crop.contains_exclusive(point) {
+                            controller.pointer_gesture = Some(PointerGesture::Move);
+                        }
+                    }
+                    AnnotationTool::Pen | AnnotationTool::Rectangle => {
+                        controller.pointer_gesture = Some(PointerGesture::Annotate);
+                        controller.apply(CaptureCommand::BeginAnnotation(point));
+                    }
+                },
+                _ => return,
+            }
             controller.log.duration("input.down.apply", started);
             let refresh_started = Instant::now();
-            match refresh_kind {
-                "selection" => refresh_selection_geometry(&ui, &controller),
-                "annotation" => {
-                    refresh_selection_geometry(&ui, &controller);
-                    refresh_editor_overlay(&ui, &controller);
-                }
-                _ => refresh_ui(&ui, &controller),
-            }
+            refresh_pointer_visuals(&ui, &controller);
             controller
                 .log
                 .duration("input.down.refresh", refresh_started);
@@ -341,7 +435,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut controller = state.borrow_mut();
             let point = controller.to_physical(x, y);
+            ui.set_canvas_cursor_kind(cursor_kind_for_point(&controller, point).into());
             controller.pointer_moves = controller.pointer_moves.saturating_add(1);
+            let gesture = controller.pointer_gesture;
             let dragging = matches!(
                 controller.session.state(),
                 CaptureSessionState::Selecting(selection)
@@ -352,6 +448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CaptureSessionState::Selecting(_)
             ) {
                 if !dragging && controller.should_query_snap() {
+                    controller.sync_snap_exclusions(&ui);
                     let snap_started = Instant::now();
                     match controller.host.snap().candidates_at(point) {
                         Ok(candidates) => {
@@ -383,25 +480,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                controller.apply(CaptureCommand::UpdateFreeSelection(point));
+
+                if gesture == Some(PointerGesture::Select) && !dragging {
+                    if let Some(start) = controller.last_pointer {
+                        if moved_enough(start, point) {
+                            controller.apply(CaptureCommand::BeginFreeSelection(start));
+                            controller.apply(CaptureCommand::UpdateFreeSelection(point));
+                        }
+                    }
+                } else if dragging {
+                    controller.apply(CaptureCommand::UpdateFreeSelection(point));
+                }
             } else if matches!(controller.session.state(), CaptureSessionState::Editing(_)) {
-                controller.apply(CaptureCommand::UpdateAnnotation(point));
-                if controller.should_render_visuals() {
-                    let refresh_started = Instant::now();
-                    refresh_editor_overlay(&ui, &controller);
-                    controller
-                        .log
-                        .duration("visual.annotation", refresh_started);
+                match gesture {
+                    Some(PointerGesture::Move) => {
+                        if let Some(last) = controller.last_pointer {
+                            controller.apply(CaptureCommand::MoveSelection(point - last));
+                        }
+                    }
+                    Some(PointerGesture::Resize(handle)) => {
+                        controller.apply(CaptureCommand::ResizeSelection(handle, point));
+                    }
+                    Some(PointerGesture::Annotate) => {
+                        controller.apply(CaptureCommand::UpdateAnnotation(point));
+                    }
+                    _ => {}
                 }
             }
-            if matches!(
-                controller.session.state(),
-                CaptureSessionState::Selecting(_)
-            ) && controller.should_render_visuals()
-            {
+            controller.last_pointer = Some(point);
+            ui.set_canvas_cursor_kind(cursor_kind_for_point(&controller, point).into());
+            if controller.should_render_visuals() {
                 let refresh_started = Instant::now();
-                refresh_selection_geometry(&ui, &controller);
-                controller.log.duration("visual.selection", refresh_started);
+                refresh_pointer_visuals(&ui, &controller);
+                controller.log.duration("visual.pointer", refresh_started);
             }
             if controller
                 .last_move_log_at
@@ -425,28 +536,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         let ui_weak = ui.as_weak();
-        ui.on_pointer_up(move |_x, _y| {
+        ui.on_pointer_up(move |x, y| {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
             let mut controller = state.borrow_mut();
             let started = Instant::now();
-            let was_selecting = matches!(
-                controller.session.state(),
-                CaptureSessionState::Selecting(_)
-            );
+            let point = controller.to_physical(x, y);
             match controller.session.state() {
                 CaptureSessionState::Selecting(_) => {
                     controller.apply(CaptureCommand::CommitSelection)
                 }
-                CaptureSessionState::Editing(_) => controller.apply(CaptureCommand::EndAnnotation),
+                CaptureSessionState::Editing(_) => {
+                    if controller.pointer_gesture == Some(PointerGesture::Annotate) {
+                        controller.apply(CaptureCommand::EndAnnotation);
+                    }
+                }
                 _ => return,
             };
-            if was_selecting {
-                refresh_editor_ui(&ui, &controller, true);
-            } else {
-                refresh_editor_ui(&ui, &controller, false);
-            }
+            controller.last_pointer = Some(point);
+            controller.pointer_gesture = None;
+            controller.last_pointer = None;
+            refresh_pointer_visuals(&ui, &controller);
             controller.log.duration("input.up.total", started);
         });
     }
@@ -460,11 +571,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut controller = state.borrow_mut();
             let tool = match tool.as_str() {
+                "pointer" => AnnotationTool::Pointer,
                 "rectangle" => AnnotationTool::Rectangle,
-                _ => AnnotationTool::Pen,
+                "pen" => AnnotationTool::Pen,
+                _ => return,
             };
             controller.apply(CaptureCommand::SelectTool(tool));
             refresh_editor_ui(&ui, &controller, false);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toolbar_pointer_down(move |x, y| {
+            let Some(_ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut controller = state.borrow_mut();
+            let point = controller.to_physical(x, y);
+            let Some(layout) = editor_layout(&controller) else {
+                return;
+            };
+            if layout.toolbar_rect.contains_exclusive(point) {
+                controller.toolbar_drag_offset = Some(point - layout.toolbar_rect.origin);
+                _ui.set_toolbar_cursor_kind("grabbing".into());
+            }
+            controller.pointer_gesture = None;
+        });
+    }
+
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toolbar_pointer_move(move |x, y| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut controller = state.borrow_mut();
+            let point = controller.to_physical(x, y);
+            if let Some(offset) = controller.toolbar_drag_offset {
+                let next = point - offset;
+                controller.toolbar_override = Some(next);
+                refresh_selection_geometry(&ui, &controller);
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toolbar_pointer_up(move || {
+            let Some(_ui) = ui_weak.upgrade() else {
+                return;
+            };
+            state.borrow_mut().toolbar_drag_offset = None;
+            _ui.set_toolbar_cursor_kind("grab".into());
         });
     }
 
@@ -485,8 +647,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log.duration("startup.ui_show", show_started);
     {
         let mut controller = state.borrow_mut();
-        controller.scale_factor = ui.window().scale_factor() as f64;
-        sync_window_geometry(&ui, &controller, controller.frame.bounds());
+        let actual_scale = ui.window().scale_factor() as f64;
+        let capture_scale = controller.scale_factor;
+        let scale_changed = (controller.scale_factor - actual_scale).abs() > 0.01;
+        if ui_scale_hint <= 1.01 {
+            controller.scale_factor = actual_scale;
+        }
+        let bounds = controller.frame.bounds();
+        sync_window_geometry(&ui, &controller, bounds);
+        if scale_changed {
+            refresh_selection_geometry(&ui, &controller);
+            refresh_editor_overlay(&ui, &controller);
+            controller.log.event(
+                "startup.scale_reconciled",
+                format!("capture_scale={capture_scale:.3} ui_scale={actual_scale:.3}"),
+            );
+        }
+        controller.sync_snap_exclusions(&ui);
         controller.log.event(
             "startup.window_ready",
             format!(
@@ -500,6 +677,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     log.event("startup.event_loop.begin", "true");
+    // Winit applies the native position/scale during the first event-loop
+    // turn. Refresh once after that turn so the initial selecting overlay uses
+    // the same geometry as subsequent tool changes.
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(1), move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let mut controller = state.borrow_mut();
+            if ui_scale_hint <= 1.01 {
+                controller.scale_factor = ui.window().scale_factor() as f64;
+            }
+            let bounds = controller.frame.bounds();
+            sync_window_geometry(&ui, &controller, bounds);
+            refresh_ui(&ui, &controller);
+            controller.log.event("startup.deferred_ui_refresh", "true");
+        });
+    }
     let event_loop_started = Instant::now();
     slint::run_event_loop()?;
     log.event("shutdown.event_loop.end", "true");
@@ -521,13 +718,34 @@ fn state_label(state: &CaptureSessionState) -> &'static str {
     }
 }
 
-fn input_origin(state: &CaptureSessionState, frame_origin: PhysicalPoint) -> PhysicalPoint {
-    match state {
-        CaptureSessionState::Editing(editor) => editor.document.crop.origin,
-        CaptureSessionState::Idle
-        | CaptureSessionState::Preparing
-        | CaptureSessionState::Selecting(_) => frame_origin,
+fn cursor_kind_for_point(controller: &Controller, point: PhysicalPoint) -> &'static str {
+    let CaptureSessionState::Editing(editor) = controller.session.state() else {
+        return "default";
+    };
+    if editor.selected_tool != AnnotationTool::Pointer {
+        return "crosshair";
     }
+    let mut selection = SelectionSession::new();
+    selection.rect = editor.document.crop;
+    if let Some(handle) = selection.hit_resize_handle(point, handle_tolerance(controller)) {
+        return match handle {
+            ResizeHandle::TopLeft | ResizeHandle::BottomRight => "nwse-resize",
+            ResizeHandle::TopRight | ResizeHandle::BottomLeft => "nesw-resize",
+            ResizeHandle::Top | ResizeHandle::Bottom => "ns-resize",
+            ResizeHandle::Left | ResizeHandle::Right => "ew-resize",
+        };
+    }
+    if editor.document.crop.contains_exclusive(point) {
+        "move"
+    } else {
+        "default"
+    }
+}
+
+fn input_origin(_state: &CaptureSessionState, frame_origin: PhysicalPoint) -> PhysicalPoint {
+    // The overlay remains the full virtual desktop in every state. Selection
+    // and editor coordinates are therefore always translated from frame.origin.
+    frame_origin
 }
 
 impl Controller {
@@ -542,6 +760,36 @@ impl Controller {
                 .y
                 .saturating_add((y as f64 * self.scale_factor).round() as i32),
         )
+    }
+
+    fn sync_snap_exclusions(&mut self, ui: &CaptureWindow) {
+        #[cfg(windows)]
+        {
+            let token = ui
+                .window()
+                .window_handle()
+                .window_handle()
+                .ok()
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(handle) => {
+                        Some(SnapExclusionToken::new(handle.hwnd.get() as u64))
+                    }
+                    _ => None,
+                });
+            if token != self.overlay_token {
+                let tokens = token.into_iter().collect::<Vec<_>>();
+                self.host.snap().set_excluded_windows(&tokens);
+                self.overlay_token = token;
+                self.log.event(
+                    "snap.exclusions",
+                    format!("overlay_window={}", self.overlay_token.is_some()),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ui;
+        }
     }
 
     fn apply(&mut self, command: CaptureCommand) {
@@ -707,7 +955,7 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
             sync_window_geometry(ui, controller, controller.frame.bounds());
         }
         CaptureSessionState::Editing(_) => {
-            refresh_editor_ui(ui, controller, true);
+            refresh_editor_ui(ui, controller, false);
             controller.log.event(
                 "render.refresh_ui",
                 format!(
@@ -737,6 +985,17 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
     );
 }
 
+fn refresh_pointer_visuals(ui: &CaptureWindow, controller: &Controller) {
+    match controller.session.state() {
+        CaptureSessionState::Selecting(_) => refresh_selection_geometry(ui, controller),
+        CaptureSessionState::Editing(_) => {
+            refresh_selection_geometry(ui, controller);
+            refresh_editor_overlay(ui, controller);
+        }
+        CaptureSessionState::Idle | CaptureSessionState::Preparing => refresh_ui(ui, controller),
+    }
+}
+
 fn refresh_editor_ui(ui: &CaptureWindow, controller: &Controller, refresh_base: bool) {
     let started = Instant::now();
     let CaptureSessionState::Editing(editor) = controller.session.state() else {
@@ -746,7 +1005,9 @@ fn refresh_editor_ui(ui: &CaptureWindow, controller: &Controller, refresh_base: 
     if refresh_base {
         refresh_editor_base(ui, controller);
     }
-    sync_window_geometry(ui, controller, editor.document.crop);
+    if let Some(layout) = editor_layout(controller) {
+        sync_window_geometry(ui, controller, layout.window_bounds);
+    }
     refresh_selection_geometry(ui, controller);
     refresh_editor_overlay(ui, controller);
     controller.log.event(
@@ -761,29 +1022,10 @@ fn refresh_editor_ui(ui: &CaptureWindow, controller: &Controller, refresh_base: 
 }
 
 fn refresh_editor_base(ui: &CaptureWindow, controller: &Controller) {
-    let CaptureSessionState::Editing(editor) = controller.session.state() else {
-        return;
-    };
-    let flatten_started = Instant::now();
-    let image = match flatten(&editor.document) {
-        Ok(rendered) => {
-            controller.log.duration("render.flatten", flatten_started);
-            let image_started = Instant::now();
-            let image = image_from_rgba(rendered.width, rendered.height, &rendered.pixels);
-            controller
-                .log
-                .duration("render.editor_image", image_started);
-            image
-        }
-        Err(error) => {
-            controller.log.event("render.flatten.error", error);
-            let image_started = Instant::now();
-            let image = image_from_frame(&controller.frame);
-            controller.log.duration("render.frame_image", image_started);
-            image
-        }
-    };
-    ui.set_frame_image(image);
+    // Keep the editor on the same full-desktop canvas as the selection state.
+    // Copy/save/pin flatten the document separately, while the live overlay
+    // draws annotations in global coordinates.
+    ui.set_frame_image(image_from_frame(&controller.frame));
 }
 
 fn refresh_editor_overlay(ui: &CaptureWindow, controller: &Controller) {
@@ -794,13 +1036,13 @@ fn refresh_editor_overlay(ui: &CaptureWindow, controller: &Controller) {
             let scale = controller.scale_factor as f32;
             for annotation in &editor.document.annotations {
                 let (annotation_path, annotation_width) =
-                    annotation_path(annotation, editor.document.crop, scale);
+                    annotation_path(annotation, controller.frame.origin, scale);
                 path.push_str(&annotation_path);
                 width = annotation_width;
             }
             if let Some(annotation) = editor.active_preview() {
                 let (annotation_path, annotation_width) =
-                    annotation_path(&annotation, editor.document.crop, scale);
+                    annotation_path(&annotation, controller.frame.origin, scale);
                 path.push_str(&annotation_path);
                 width = annotation_width;
             }
@@ -815,38 +1057,84 @@ fn refresh_editor_overlay(ui: &CaptureWindow, controller: &Controller) {
 }
 
 fn refresh_selection_geometry(ui: &CaptureWindow, controller: &Controller) {
-    let (rect, editing, tool) = match controller.session.state() {
-        CaptureSessionState::Selecting(selection) => (selection.rect, false, "pen"),
-        CaptureSessionState::Editing(editor) => (
-            PhysicalRect::new(PhysicalPoint::ZERO, editor.document.crop.size),
-            true,
-            editor.selected_tool.id(),
+    let (rect, editing, tool, window_origin, toolbar) = match controller.session.state() {
+        CaptureSessionState::Selecting(selection) => (
+            selection.rect,
+            false,
+            "pointer",
+            controller.frame.origin,
+            None,
         ),
-        CaptureSessionState::Idle | CaptureSessionState::Preparing => {
-            (PhysicalRect::default(), false, "pen")
+        CaptureSessionState::Editing(editor) => {
+            let Some(layout) = editor_layout(controller) else {
+                return;
+            };
+            (
+                editor.document.crop,
+                true,
+                editor.selected_tool.id(),
+                controller.frame.origin,
+                Some((layout.toolbar_rect, layout.toolbar_reason, layout.work_area)),
+            )
         }
-    };
-    let origin = if editing {
-        PhysicalPoint::ZERO
-    } else {
-        controller.frame.origin
+        CaptureSessionState::Idle | CaptureSessionState::Preparing => (
+            PhysicalRect::default(),
+            false,
+            "pointer",
+            controller.frame.origin,
+            None,
+        ),
     };
     let scale = controller.scale_factor as f32;
-    ui.set_selection_x((rect.origin.x - origin.x) as f32 / scale);
-    ui.set_selection_y((rect.origin.y - origin.y) as f32 / scale);
+    ui.set_selection_x((rect.origin.x - window_origin.x) as f32 / scale);
+    ui.set_selection_y((rect.origin.y - window_origin.y) as f32 / scale);
     ui.set_selection_width(rect.size.width as f32 / scale);
     ui.set_selection_height(rect.size.height as f32 / scale);
     ui.set_selecting(!editing);
     ui.set_editing(editing);
     ui.set_active_tool(tool.into());
+    if let Some((toolbar_rect, reason, work_area)) = toolbar {
+        ui.set_toolbar_x((toolbar_rect.origin.x - window_origin.x) as f32 / scale);
+        ui.set_toolbar_y((toolbar_rect.origin.y - window_origin.y) as f32 / scale);
+        ui.set_toolbar_visible(true);
+        ui.set_toolbar_inside(reason == ToolbarPlacementReason::InsideBottom);
+        if controller
+            .last_toolbar_log_at
+            .get()
+            .is_none_or(|last| last.elapsed() >= Duration::from_millis(250))
+        {
+            controller.last_toolbar_log_at.set(Some(Instant::now()));
+            controller.log.event(
+                "toolbar.layout",
+                format!(
+                    "reason={reason:?} rect={}x{}+{}+{} work_area={}x{}+{}+{}",
+                    toolbar_rect.width(),
+                    toolbar_rect.height(),
+                    toolbar_rect.origin.x,
+                    toolbar_rect.origin.y,
+                    work_area.width(),
+                    work_area.height(),
+                    work_area.origin.x,
+                    work_area.origin.y,
+                ),
+            );
+        }
+    } else {
+        ui.set_toolbar_visible(false);
+        ui.set_toolbar_inside(false);
+    }
     ui.set_status(controller.status.clone().into());
 }
 
-fn annotation_path(annotation: &Annotation, crop: PhysicalRect, scale: f32) -> (String, f32) {
+fn annotation_path(
+    annotation: &Annotation,
+    canvas_origin: PhysicalPoint,
+    scale: f32,
+) -> (String, f32) {
     let local = |point: PhysicalPoint| {
         (
-            (point.x - crop.origin.x) as f32 / scale,
-            (point.y - crop.origin.y) as f32 / scale,
+            (point.x - canvas_origin.x) as f32 / scale,
+            (point.y - canvas_origin.y) as f32 / scale,
         )
     };
     match annotation {
@@ -877,6 +1165,59 @@ fn annotation_path(annotation: &Annotation, crop: PhysicalRect, scale: f32) -> (
             )
         }
     }
+}
+
+fn is_committable_snap(candidate: &SnapCandidate) -> bool {
+    candidate.kind != SnapKind::Desktop && !candidate.bounds.is_empty()
+}
+
+fn handle_tolerance(controller: &Controller) -> u32 {
+    ((10.0 * controller.scale_factor).round() as u32).max(6)
+}
+
+fn moved_enough(start: PhysicalPoint, current: PhysicalPoint) -> bool {
+    (current.x as i64 - start.x as i64).unsigned_abs() > 2
+        || (current.y as i64 - start.y as i64).unsigned_abs() > 2
+}
+
+fn editor_layout(controller: &Controller) -> Option<EditorLayout> {
+    let CaptureSessionState::Editing(editor) = controller.session.state() else {
+        return None;
+    };
+    let selection = editor.document.crop;
+    let frame_bounds = controller.frame.bounds();
+    let work_area = controller
+        .monitors
+        .iter()
+        .find(|monitor| monitor.work_area.contains(selection.center()))
+        .map(|monitor| monitor.work_area)
+        .or_else(|| {
+            controller
+                .monitors
+                .iter()
+                .find(|monitor| monitor.bounds.contains(selection.center()))
+                .map(|monitor| monitor.work_area)
+        })
+        .unwrap_or(frame_bounds);
+    let toolbar_size = PhysicalSize::new(
+        (548.0 * controller.scale_factor).round().max(1.0) as u32,
+        (64.0 * controller.scale_factor).round().max(1.0) as u32,
+    );
+    let placement = place_toolbar(selection, toolbar_size, work_area, 12);
+    let (toolbar_rect, toolbar_reason) = if let Some(origin) = controller.toolbar_override {
+        (
+            PhysicalRect::new(origin, toolbar_size).clamp(work_area),
+            ToolbarPlacementReason::Clamped,
+        )
+    } else {
+        (placement.rect, placement.reason)
+    };
+    Some(EditorLayout {
+        window_bounds: frame_bounds,
+        toolbar_rect,
+        work_area,
+        toolbar_reason,
+    })
 }
 
 fn sync_window_geometry(ui: &CaptureWindow, controller: &Controller, bounds: PhysicalRect) {
@@ -948,7 +1289,7 @@ mod tests {
     use capture_core::capture::PixelFormat;
 
     #[test]
-    fn editing_input_origin_follows_crop_origin() {
+    fn editing_input_origin_stays_on_full_frame_overlay() {
         let frame = CapturedFrame::new(
             Arc::<[u8]>::from(vec![0; 400 * 300 * 4]),
             400,
@@ -970,7 +1311,7 @@ mod tests {
 
         assert_eq!(
             input_origin(session.state(), PhysicalPoint::new(-2560, 0)),
-            PhysicalPoint::new(-2360, 100)
+            PhysicalPoint::new(-2560, 0)
         );
     }
 }

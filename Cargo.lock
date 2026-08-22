@@ -772,6 +772,7 @@ dependencies = [
  "capture-platform-api",
  "capture-render",
  "capture-windows",
+ "raw-window-handle",
  "slint",
  "slint-build",
 ]

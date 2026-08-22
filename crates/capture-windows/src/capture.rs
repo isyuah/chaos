@@ -180,10 +180,30 @@ fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 
 /// Capture one physical-pixel frame of the complete virtual desktop.
 fn capture_virtual_screen() -> Result<CapturedFrame, CaptureError> {
-    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    // Prefer the monitor rectangles returned by the same DPI-aware process.
+    // GetSystemMetrics is DPI-virtualized when the process context was set too
+    // late, which can otherwise make the overlay larger or shift its origin.
+    let monitor_bounds = enumerate_monitors().ok().and_then(|monitors| {
+        monitors
+            .into_iter()
+            .map(|monitor| monitor.bounds)
+            .reduce(capture_core::PhysicalRect::union)
+    });
+    let (vx, vy, vw, vh) = if let Some(bounds) = monitor_bounds {
+        (
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width as i32,
+            bounds.size.height as i32,
+        )
+    } else {
+        (
+            unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+        )
+    };
     if vw <= 0 || vh <= 0 {
         return Err(CaptureError::CaptureFailed(
             "virtual screen has zero size".to_string(),

@@ -11,12 +11,21 @@ export component CaptureWindow inherits Window {
     in property <string> annotation-path;
     in property <float> annotation-width;
     in property <bool> annotation-visible;
+    in property <float> toolbar-x;
+    in property <float> toolbar-y;
+    in property <bool> toolbar-visible;
+    in property <bool> toolbar-inside;
+    in property <string> canvas-cursor-kind;
+    in property <string> toolbar-cursor-kind;
 
     callback pointer-down(float, float);
     callback pointer-move(float, float);
     callback pointer-up(float, float);
     callback choose-tool(string);
     callback run-action(string);
+    callback toolbar-pointer-down(float, float);
+    callback toolbar-pointer-move(float, float);
+    callback toolbar-pointer-up();
 
     no-frame: true;
     always-on-top: true;
@@ -66,9 +75,38 @@ export component CaptureWindow inherits Window {
             visible: root.selection-width > 0 && root.selection-height > 0;
         }
 
+        // Handles stay fixed in physical size so resizing remains discoverable
+        // at every selection scale.
+        for handle in [
+            { x: root.selection-x * 1px - 5px, y: root.selection-y * 1px - 5px },
+            { x: (root.selection-x + root.selection-width / 2) * 1px - 5px, y: root.selection-y * 1px - 5px },
+            { x: (root.selection-x + root.selection-width) * 1px - 5px, y: root.selection-y * 1px - 5px },
+            { x: (root.selection-x + root.selection-width) * 1px - 5px, y: (root.selection-y + root.selection-height / 2) * 1px - 5px },
+            { x: (root.selection-x + root.selection-width) * 1px - 5px, y: (root.selection-y + root.selection-height) * 1px - 5px },
+            { x: (root.selection-x + root.selection-width / 2) * 1px - 5px, y: (root.selection-y + root.selection-height) * 1px - 5px },
+            { x: root.selection-x * 1px - 5px, y: (root.selection-y + root.selection-height) * 1px - 5px },
+            { x: root.selection-x * 1px - 5px, y: (root.selection-y + root.selection-height / 2) * 1px - 5px }
+        ] : Rectangle {
+            x: handle.x;
+            y: handle.y;
+            width: 10px;
+            height: 10px;
+            visible: root.editing && root.active-tool == "pointer" && root.selection-width > 0 && root.selection-height > 0;
+            background: #70d6ff;
+            border-width: 1px;
+            border-color: #0c1a23;
+            border-radius: 2px;
+        }
+
         TouchArea {
             width: parent.width;
             height: parent.height;
+            mouse-cursor: root.canvas-cursor-kind == "move" ? move :
+                root.canvas-cursor-kind == "crosshair" ? crosshair :
+                root.canvas-cursor-kind == "nwse-resize" ? nwse-resize :
+                root.canvas-cursor-kind == "nesw-resize" ? nesw-resize :
+                root.canvas-cursor-kind == "ns-resize" ? ns-resize :
+                root.canvas-cursor-kind == "ew-resize" ? ew-resize : default;
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                     root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px);
@@ -76,25 +114,59 @@ export component CaptureWindow inherits Window {
                 if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
                     root.pointer-up(self.mouse-x / 1px, self.mouse-y / 1px);
                 }
+                if (event.kind == PointerEventKind.move) {
+                    root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
             }
-            moved => { root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px); }
         }
 
         Rectangle {
-            visible: root.editing;
-            x: max(12px, min(parent.width - self.width - 12px, root.selection-x * 1px));
-            y: max(12px, min(parent.height - self.height - 12px, (root.selection-y + root.selection-height) * 1px + 12px));
-            width: 392px;
-            height: 56px;
-            border-radius: 12px;
+            visible: root.toolbar-visible;
+            x: root.toolbar-x * 1px;
+            y: root.toolbar-y * 1px;
+            width: 548px;
+            height: 64px;
+            border-radius: 8px;
             background: #1b222b;
             border-width: 1px;
             border-color: #455161;
 
+            Rectangle {
+                y: 0px;
+                width: parent.width;
+                height: 16px;
+                background: root.toolbar-inside ? #263747 : #202a34;
+                TouchArea {
+                    mouse-cursor: root.toolbar-cursor-kind == "grabbing" ? grabbing : grab;
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                            root.toolbar-pointer-down(self.mouse-x / 1px + root.toolbar-x, self.mouse-y / 1px + root.toolbar-y);
+                        }
+                        if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                            root.toolbar-pointer-up();
+                        }
+                    }
+                    moved => {
+                        root.toolbar-pointer-move(self.mouse-x / 1px + root.toolbar-x, self.mouse-y / 1px + root.toolbar-y);
+                    }
+                }
+            }
+
             HorizontalLayout {
+                y: 16px;
+                height: 48px;
                 padding-left: 8px;
                 padding-right: 8px;
                 spacing: 6px;
+
+                Rectangle {
+                    width: 56px;
+                    height: 40px;
+                    border-radius: 6px;
+                    background: root.active-tool == "pointer" ? #284b64 : #222b35;
+                    TouchArea { clicked => { root.choose-tool("pointer"); } }
+                    Text { text: "Pointer"; color: #d8e4ee; horizontal-alignment: center; vertical-alignment: center; }
+                }
 
                 Rectangle {
                     width: 44px;

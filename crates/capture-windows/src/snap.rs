@@ -7,10 +7,12 @@ use capture_core::{
 use capture_platform_api::SnapBackend;
 use std::sync::Mutex;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, IsIconic,
     IsWindowVisible, GWL_EXSTYLE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -41,7 +43,7 @@ impl SnapBackend for WindowsSnapBackend {
     fn capabilities(&self) -> SnapCapabilities {
         SnapCapabilities {
             window_level: true,
-            element_level: false,
+            element_level: true,
             expose_label: true,
         }
     }
@@ -69,6 +71,10 @@ impl SnapBackend for WindowsSnapBackend {
             candidates: Vec::new(),
             next_z_order: 0,
         };
+
+        if let Some(candidate) = ui_automation_candidate(point, &context.excluded) {
+            context.candidates.push(candidate);
+        }
 
         let ok = unsafe {
             EnumWindows(
@@ -100,6 +106,62 @@ impl SnapBackend for WindowsSnapBackend {
 
         Ok(rank_candidates(point, context.candidates))
     }
+}
+
+/// Query the deepest UI Automation element under the pointer. This is best
+/// effort: applications are allowed to expose no UIA provider, in which case
+/// the window-level candidates remain available.
+fn ui_automation_candidate(point: PhysicalPoint, excluded: &[u64]) -> Option<SnapCandidate> {
+    let automation: IUIAutomation =
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()? };
+    let element = unsafe {
+        automation
+            .ElementFromPoint(POINT {
+                x: point.x,
+                y: point.y,
+            })
+            .ok()?
+    };
+    let bounds = unsafe { element.CurrentBoundingRectangle().ok()? };
+    let rect = rect_to_physical(bounds);
+    if rect.is_empty() || !rect.contains_exclusive(point) {
+        return None;
+    }
+
+    let hwnd = unsafe { element.CurrentNativeWindowHandle().ok()? };
+    let hwnd_value = hwnd.0 as u64;
+    if hwnd_value == 0 || excluded.contains(&hwnd_value) {
+        return None;
+    }
+
+    // Do not duplicate a top-level window when UI Automation returns its root
+    // element rather than a child control.
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_ok()
+        && rect == rect_to_physical(window_rect)
+    {
+        return None;
+    }
+
+    let label = unsafe { element.CurrentName().ok() }
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty());
+    let id = SnapCandidateId::new(
+        hwnd_value
+            .rotate_left(17)
+            .wrapping_add(rect.origin.x as u32 as u64)
+            .rotate_left(17)
+            .wrapping_add(rect.origin.y as u32 as u64)
+            .wrapping_add(rect.size.width as u64)
+            .wrapping_add((rect.size.height as u64) << 32),
+    );
+    Some(SnapCandidate {
+        id,
+        bounds: rect,
+        kind: SnapKind::Element,
+        label,
+        z_order: 0,
+    })
 }
 
 struct SnapContext {
@@ -189,6 +251,16 @@ fn visual_bounds(hwnd: HWND, fallback: RECT) -> PhysicalRect {
         )
     };
     let rect = if result.is_ok() { visual } else { fallback };
+    PhysicalRect::new(
+        PhysicalPoint::new(rect.left, rect.top),
+        capture_core::PhysicalSize::new(
+            rect.right.saturating_sub(rect.left) as u32,
+            rect.bottom.saturating_sub(rect.top) as u32,
+        ),
+    )
+}
+
+fn rect_to_physical(rect: RECT) -> PhysicalRect {
     PhysicalRect::new(
         PhysicalPoint::new(rect.left, rect.top),
         capture_core::PhysicalSize::new(
