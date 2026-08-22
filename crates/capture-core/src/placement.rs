@@ -5,6 +5,10 @@
 
 use crate::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
 
+fn saturating_i64_to_i32(value: i64) -> i32 {
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 /// Why a placement was chosen (vertical strategy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarPlacementReason {
@@ -41,23 +45,32 @@ pub fn place_toolbar(
     work_area: PhysicalRect,
     preferred_gap: u32,
 ) -> ToolbarPlacement {
-    let tw = toolbar_size.width as i32;
-    let th = toolbar_size.height as i32;
-    let gap = preferred_gap as i32;
+    let tw = toolbar_size.width as i64;
+    let th = toolbar_size.height as i64;
+    let gap = preferred_gap as i64;
 
-    let center_x = selection.center().x;
+    let center_x = selection.center().x as i64;
     let base_x = center_x - tw / 2;
 
     let below = PhysicalRect::new(
-        PhysicalPoint::new(base_x, selection.bottom() + gap),
+        PhysicalPoint::new(
+            saturating_i64_to_i32(base_x),
+            saturating_i64_to_i32(selection.bottom() as i64 + gap),
+        ),
         toolbar_size,
     );
     let above = PhysicalRect::new(
-        PhysicalPoint::new(base_x, selection.top() - gap - th),
+        PhysicalPoint::new(
+            saturating_i64_to_i32(base_x),
+            saturating_i64_to_i32(selection.top() as i64 - gap - th),
+        ),
         toolbar_size,
     );
     let inside = PhysicalRect::new(
-        PhysicalPoint::new(base_x, selection.bottom() - gap - th),
+        PhysicalPoint::new(
+            saturating_i64_to_i32(base_x),
+            saturating_i64_to_i32(selection.bottom() as i64 - gap - th),
+        ),
         toolbar_size,
     );
 
@@ -90,13 +103,13 @@ pub fn place_toolbar(
 }
 
 fn clamp_horizontal(rect: PhysicalRect, work_area: PhysicalRect) -> PhysicalRect {
-    let tw = rect.size.width as i32;
-    let wa_w = work_area.size.width as i32;
+    let tw = rect.size.width as i64;
+    let wa_w = work_area.size.width as i64;
     let min_x = work_area.origin.x;
     let max_x = if tw >= wa_w {
         min_x
     } else {
-        work_area.right() - tw
+        saturating_i64_to_i32(work_area.right() as i64 - tw)
     };
     PhysicalRect::new(
         PhysicalPoint::new(rect.origin.x.clamp(min_x, max_x), rect.origin.y),
@@ -151,10 +164,9 @@ mod tests {
         let sel = r(960, 500, 2, 2);
         let p = place_toolbar(sel, s(320, 40), work(), 8);
         assert_eq!(p.reason, ToolbarPlacementReason::Below);
-        assert!(p.rect.contains_exclusive(PhysicalPoint::new(
-            p.rect.origin.x + 1,
-            p.rect.origin.y + 1
-        )));
+        assert!(p
+            .rect
+            .contains_exclusive(PhysicalPoint::new(p.rect.origin.x + 1, p.rect.origin.y + 1)));
     }
 
     #[test]

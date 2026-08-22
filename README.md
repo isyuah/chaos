@@ -14,7 +14,7 @@ crates/capture-annotation     annotation document, undo, capture session state m
 crates/capture-render         flatten + PNG encode + golden tests
 crates/capture-actions        Copy / Save / Pin / AskAI payloads
 crates/capture-windows        GDI capture + window snap (real)
-crates/capture-linux          compilable Linux route (skeleton)
+crates/capture-linux          X11 capture + EWMH snap; Wayland capability route
 tools/capture-cli             acceptance CLI for the frozen Core
 docs/                         architecture + ADRs + change-request template
 ```
@@ -23,7 +23,8 @@ docs/                         architecture + ADRs + change-request template
 
 ```sh
 cargo build --workspace
-cargo test --workspace          # 49 unit tests, 0 warnings
+cargo test --workspace          # shared Core and regression tests
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## CLI (frozen-Core gate)
@@ -32,15 +33,17 @@ cargo test --workspace          # 49 unit tests, 0 warnings
 cargo run -p capture-cli -- --help
 cargo run -p capture-cli -- monitors
 cargo run -p capture-cli -- capture-monitor 0 --output out.png
+cargo run -p capture-cli -- capture-virtual-desktop --output virtual.png
 cargo run -p capture-cli -- candidates-at 100 100
 cargo run -p capture-cli -- test-toolbar-placement
 cargo run -p capture-cli -- render-test
 cargo run -p capture-cli -- session-test 0
 ```
 
-See `CORE_BASELINE_REPORT.md` for the frozen baseline, real Windows verification,
-benchmark, known issues, and how each frontend plugs in. The frozen tag is
-`demo-core-v1`.
+The monitor command prints stable IDs and ordinals. The ordinal is convenient
+for the CLI; frontends should retain the stable `MonitorId`. See
+`CORE_BASELINE_REPORT.md` for the historical tag, current repairs, real Windows
+verification, known limitations, and frontend integration contract.
 
 ## Frontend note
 

@@ -4,20 +4,21 @@
 //! monitor, so monitor bounds (including negative origins) match exactly.
 
 use capture_core::{
-    CaptureCapabilities, CaptureError, CapturedFrame, MonitorId, MonitorInfo, PixelFormat,
-    ScaleFactor,
+    CaptureCapabilities, CaptureError, CapturedFrame, MonitorId, MonitorInfo, PhysicalPoint,
+    PixelFormat, ScaleFactor,
 };
 use capture_platform_api::CaptureBackend;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors,
-    GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-    DIB_RGB_COLORS, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, SRCCOPY, BI_RGB,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW, SRCCOPY,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 /// The Windows GDI capture backend.
@@ -29,11 +30,18 @@ impl WindowsCaptureBackend {
     }
 }
 
+impl Default for WindowsCaptureBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CaptureBackend for WindowsCaptureBackend {
     fn capabilities(&self) -> CaptureCapabilities {
         CaptureCapabilities {
             multi_monitor: true,
             per_monitor_dpi: true,
+            capture_virtual_desktop: true,
             capture_window: false,
             live_preview: false,
         }
@@ -49,8 +57,17 @@ impl CaptureBackend for WindowsCaptureBackend {
             .iter()
             .find(|m| m.id == id)
             .ok_or(CaptureError::MonitorNotFound(id))?;
-        capture_monitor_rect(&monitor.bounds, monitor.scale_factor)
+        self.capture_virtual_desktop()?.crop(monitor.bounds)
     }
+
+    fn capture_virtual_desktop(&self) -> Result<CapturedFrame, CaptureError> {
+        capture_virtual_screen()
+    }
+}
+
+struct MonitorEnumContext {
+    monitors: Vec<MonitorInfo>,
+    error: Option<CaptureError>,
 }
 
 /// GDI callback for `EnumDisplayMonitors`.
@@ -60,9 +77,13 @@ unsafe extern "system" fn enum_monitor_cb(
     _rect: *mut RECT,
     lparam: LPARAM,
 ) -> BOOL {
-    let list = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
-    if let Ok(info) = monitor_from_hmonitor(hmonitor) {
-        list.push(info);
+    let context = &mut *(lparam.0 as *mut MonitorEnumContext);
+    match monitor_from_hmonitor(hmonitor) {
+        Ok(info) => context.monitors.push(info),
+        Err(error) => {
+            context.error = Some(error);
+            return BOOL(0);
+        }
     }
     BOOL(1)
 }
@@ -78,12 +99,12 @@ fn monitor_from_hmonitor(hmonitor: HMONITOR) -> Result<MonitorInfo, CaptureError
     }
     let rc = mi.monitorInfo.rcMonitor;
     let bounds = rect_to_physical(rc);
+    let work_area = rect_to_physical(mi.monitorInfo.rcWork);
 
     let scale = {
         let mut dpi_x: u32 = 0;
         let mut dpi_y: u32 = 0;
-        if unsafe { GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
-            .is_ok()
+        if unsafe { GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok()
             && dpi_x > 0
         {
             ScaleFactor::new(dpi_x as f64 / 96.0)
@@ -93,13 +114,13 @@ fn monitor_from_hmonitor(hmonitor: HMONITOR) -> Result<MonitorInfo, CaptureError
     };
 
     let name = device_name(&mi.szDevice);
-    // Windows always places the primary monitor's top-left at (0,0).
-    let is_primary = bounds.origin.x == 0 && bounds.origin.y == 0;
+    let is_primary = (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
 
     Ok(MonitorInfo {
-        id: MonitorId::new(0), // filled in by the enumerator
+        id: MonitorId::from_stable_key(&name),
         name,
         bounds,
+        work_area,
         scale_factor: scale,
         is_primary,
     })
@@ -119,33 +140,46 @@ fn rect_to_physical(r: RECT) -> capture_core::PhysicalRect {
 
 /// Enumerate monitors and assign stable 0-based ids.
 fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
-    let mut list: Vec<MonitorInfo> = Vec::new();
-    // First get raw monitor descriptions (ids are all 0 here).
+    let mut context = MonitorEnumContext {
+        monitors: Vec::new(),
+        error: None,
+    };
     let ok = unsafe {
         EnumDisplayMonitors(
             None,
             None,
             Some(enum_monitor_cb),
-            LPARAM(&mut list as *mut Vec<MonitorInfo> as isize),
+            LPARAM(&mut context as *mut MonitorEnumContext as isize),
         )
     };
     if !ok.as_bool() {
+        if let Some(error) = context.error {
+            return Err(error);
+        }
         return Err(CaptureError::CaptureFailed(
             "EnumDisplayMonitors failed".to_string(),
         ));
     }
-    // Assign index-based ids in enum order.
-    for (i, m) in list.iter_mut().enumerate() {
-        m.id = MonitorId::new(i as u32);
+    if let Some(error) = context.error {
+        return Err(error);
     }
-    Ok(list)
+    if context.monitors.is_empty() {
+        return Err(CaptureError::CaptureFailed(
+            "no monitors were returned by EnumDisplayMonitors".to_string(),
+        ));
+    }
+    context.monitors.sort_by_key(|monitor| {
+        (
+            monitor.bounds.origin.x,
+            monitor.bounds.origin.y,
+            monitor.name.clone(),
+        )
+    });
+    Ok(context.monitors)
 }
 
-/// Capture the physical pixels of a single monitor rect from the virtual desktop.
-fn capture_monitor_rect(
-    bounds: &capture_core::PhysicalRect,
-    _scale: ScaleFactor,
-) -> Result<CapturedFrame, CaptureError> {
+/// Capture one physical-pixel frame of the complete virtual desktop.
+fn capture_virtual_screen() -> Result<CapturedFrame, CaptureError> {
     let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -156,17 +190,6 @@ fn capture_monitor_rect(
         ));
     }
     let (vw, vh) = (vw as u32, vh as u32);
-
-    // Locate the monitor within the captured virtual screen.
-    let crop_x0 = (bounds.origin.x - vx) as i64;
-    let crop_y0 = (bounds.origin.y - vy) as i64;
-    let crop_w = bounds.size.width as i64;
-    let crop_h = bounds.size.height as i64;
-    if crop_x0 < 0 || crop_y0 < 0 || crop_x0 + crop_w > vw as i64 || crop_y0 + crop_h > vh as i64 {
-        return Err(CaptureError::CaptureFailed(
-            "monitor rect outside virtual screen".to_string(),
-        ));
-    }
 
     // --- GDI capture of the full virtual screen ---
     let screen_dc = unsafe { GetDC(None) };
@@ -198,8 +221,8 @@ fn capture_monitor_rect(
             vw as i32,
             vh as i32,
             Some(screen_dc),
-            0,
-            0,
+            vx,
+            vy,
             SRCCOPY,
         )
     };
@@ -251,29 +274,20 @@ fn capture_monitor_rect(
         return Err(CaptureError::CaptureFailed("GetDIBits failed".to_string()));
     }
 
-    // --- Crop the monitor region and convert BGRA -> RGBA ---
-    let mut out = vec![0u8; (crop_w as usize) * (crop_h as usize) * 4];
-    let full_stride = vw as usize * 4;
-    let out_stride = crop_w as usize * 4;
-    for y in 0..crop_h as usize {
-        let src_row = (crop_y0 as usize + y) * full_stride + (crop_x0 as usize) * 4;
-        let dst_row = y * out_stride;
-        for x in 0..crop_w as usize {
-            let s = src_row + x * 4;
-            let d = dst_row + x * 4;
-            out[d] = buf[s + 2];
-            out[d + 1] = buf[s + 1];
-            out[d + 2] = buf[s];
-            out[d + 3] = buf[s + 3];
-        }
+    let mut out = vec![0u8; buf.len()];
+    for (src, dst) in buf.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = 255;
     }
 
     Ok(CapturedFrame::new(
         out.into(),
-        crop_w as u32,
-        crop_h as u32,
-        out_stride as u32,
-        capture_core::PhysicalPoint::new(bounds.origin.x, bounds.origin.y),
+        vw,
+        vh,
+        vw.saturating_mul(4),
+        PhysicalPoint::new(vx, vy),
         PixelFormat::Rgba8,
     ))
 }

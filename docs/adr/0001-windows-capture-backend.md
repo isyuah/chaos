@@ -35,20 +35,23 @@ Rationale:
         virtual desktop
    GetDC(NULL) ──CreateCompatibleDC + CompatibleBitmap──► memDC
         │                                                     │
-        └─ BitBlt(memDC, 0,0, W,H, screenDC, x,y, SRCCOPY) ──►│
+        └─ BitBlt(memDC, 0,0, VW,VH, screenDC, VX,VY, SRCCOPY) ──►│
                                                               ▼
-                                    GetDIBits → BGRA rows (bottom-up)
+                                    GetDIBits → top-down BGRA rows
                                                               ▼
-                                 flip rows, BGRA→RGBA → CapturedFrame.pixels
+                                 BGRA→RGBA → full frame → crop → CapturedFrame
 ```
 
-`x,y` is the monitor's virtual origin minus the virtual-screen origin, and
-`W,H` is the monitor size — both physical pixels.
+`VX,VY,VW,VH` are the virtual desktop's physical bounds, including negative
+origins. Capturing the full source with `VX,VY` is important: using `(0,0)`
+silently reads the primary monitor when the virtual desktop starts at a
+negative coordinate. The requested monitor is cropped afterward using its
+physical bounds.
 
 ## Consequences
 
 - Simplicity and testability win for the demo.
-- Per-monitor `BitBlt` in a tight loop is not the fastest path for high-FPS
+- Full-virtual-desktop `BitBlt` per capture is not the fastest path for high-FPS
   capture; the Core deliberately does not promise realtime preview from the
   backend (frontends preview from their own surface).
 - Windows.Graphics.Capture / DXGI migration is isolated inside

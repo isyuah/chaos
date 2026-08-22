@@ -1,7 +1,10 @@
-# CORE_BASELINE_REPORT — capture-ui-eval shared Core (demo-core-v1)
+# CORE_BASELINE_REPORT — capture-ui-eval shared Core
 
 Frozen commit: `4de8ddd0e21a84ad2a9ec7030fa89d67acd4b9fd`
 Tag: `demo-core-v1`
+The tag above is the historical baseline. The current working tree contains
+the post-review repair set described in §16 and has intentionally not been
+retagged or pushed.
 Build environment: Windows 11, `rustc 1.97.1` (`x86_64-pc-windows-msvc`), `cargo 1.97.1`
 
 ---
@@ -85,8 +88,8 @@ pub struct CapturedFrame {
     pub origin: PhysicalPoint,
     pub pixel_format: PixelFormat,
 }
-pub struct MonitorInfo { id, name, bounds, scale_factor, is_primary }
-pub struct MonitorId(pub u32);
+pub struct MonitorInfo { id, name, bounds, work_area, scale_factor, is_primary }
+pub struct MonitorId(pub u64); // stable platform-derived identity
 pub enum PixelFormat { Rgba8, Bgra8, Rgb24, U8 }
 pub struct Timing { t0_hotkey_received, t1_frame_ready, ... }
 ```
@@ -112,11 +115,13 @@ pub trait CaptureBackend: Send + Sync {
     fn capabilities(&self) -> CaptureCapabilities;
     fn monitors(&self) -> Result<Vec<MonitorInfo>, CaptureError>;
     fn capture_monitor(&self, id: MonitorId) -> Result<CapturedFrame, CaptureError>;
+    fn capture_virtual_desktop(&self) -> Result<CapturedFrame, CaptureError>;
 }
 pub trait SnapBackend: Send + Sync {
     fn capabilities(&self) -> SnapCapabilities;
     fn candidates_at(&self, point: PhysicalPoint) -> Result<Vec<SnapCandidate>, SnapError>;
     fn set_excluded_window(&self, token: Option<SnapExclusionToken>) { let _ = token; }
+    fn set_excluded_windows(&self, tokens: &[SnapExclusionToken]) { let _ = tokens; }
 }
 ```
 
@@ -126,9 +131,9 @@ pub enum CaptureSessionState { Idle, Preparing, Selecting(SelectionSession), Edi
 pub enum CaptureCommand { Begin, FrameReady(CapturedFrame), PointerMoved, SnapCandidate,
                           BeginFreeSelection, UpdateFreeSelection, CommitSelection,
                           MoveSelection, ResizeSelection, SelectTool, BeginAnnotation,
-                          UpdateAnnotation, EndAnnotation, Undo, InvokeAction(ActionId), Cancel }
+                          UpdateAnnotation, EndAnnotation, Undo, Redo, InvokeAction(ActionId), Cancel }
 pub enum CaptureEvent { StateChanged, SelectionChanged, SnapCandidateChanged,
-                        DocumentChanged, ActionRequested, Completed, Error }
+                        DocumentChanged, ToolChanged, ActionRequested, Completed, Error(CaptureError) }
 pub struct CaptureSession;   // .apply(cmd) -> Vec<CaptureEvent>; .state(); .frame(); .timing()
 pub struct EditorSession { document, selected_tool, undo/redo, active_preview() }
 ```
@@ -183,7 +188,8 @@ capture of monitor 0 produced `2560x1440 origin=(-2560,0)`.
   (`biHeight` negative), then cropped to the requested monitor rect and
   converted BGRA→RGBA8.
 - `monitors()` enumerates via `EnumDisplayMonitors` + `GetMonitorInfoW`
-  (device name from `MONITORINFOEXW`); scale from `GetDpiForMonitor(…, MDT_EFFECTIVE_DPI)`.
+  (device name from `MONITORINFOEXW`), returns work areas, and derives stable
+  IDs from the device name; scale comes from `GetDpiForMonitor(…, MDT_EFFECTIVE_DPI)`.
 - `capture_monitor(id)` yields a `CapturedFrame` whose `origin` equals the
   monitor's virtual top-left (negative-origin aware).
 - **Why GDI (not WGC/DXGI):** no D3D device, no message loop, no WinRT
@@ -201,17 +207,13 @@ capture of monitor 0 produced `2560x1440 origin=(-2560,0)`.
 
 ## 5. Linux implementation status
 
-- `capture-linux` implements both traits and **cross-checks cleanly** for
-  `x86_64-unknown-linux-gnu` (`cargo check --target x86_64-unknown-linux-gnu -p capture-linux`).
-- For the demo it is a **compilable backend route**, not a production capture
-  path: `monitors`/`capture_monitor`/`candidates_at` return
-  `CaptureError::Unsupported` / `SnapError::Unsupported` with a clear message so
-  a frontend gets a deterministic "not yet implemented here" rather than a crash.
-- **Documented production route** (behind the same traits): X11 via XRandR +
-  XShm capture and `_NET_CLIENT_LIST` window querying; Wayland via the XDG
-  ScreenCast portal (`org.freedesktop.portal.ScreenCast`) for capture and the
-  compositor window API for snapping. Wayland's global-window-positioning and
-  always-on-top limitations are noted in `00_DEMO_COMMON_SPEC.md` §16.
+- `capture-linux` implements both traits and cross-checks cleanly for
+  `x86_64-unknown-linux-gnu`. X11 uses RandR 1.5 monitor enumeration,
+  root-window `GetImage` capture, and EWMH client-list/window geometry queries;
+  it returns real frames and snap candidates. Wayland is detected explicitly
+  and returns an actionable `Unsupported` result until the frontend supplies
+  the XDG ScreenCast portal / PipeWire bridge. Wayland's global-window-positioning
+  and always-on-top limitations remain documented in `00_DEMO_COMMON_SPEC.md` §16.
 
 ---
 
@@ -219,8 +221,8 @@ capture of monitor 0 produced `2560x1440 origin=(-2560,0)`.
 
 | crate | native dep | scope |
 |---|---|---|
-| `capture-windows` | `windows` 0.61 (features: `Win32_Foundation`, `Win32_Graphics_Gdi`, `Win32_UI_HiDpi`, `Win32_UI_WindowsAndMessaging`) | GDI capture, DPI awareness, window enumeration |
-| `capture-linux` | *(none; pure-Rust skeleton)* | — |
+| `capture-windows` | `windows` 0.61 (features: `Win32_Foundation`, `Win32_Graphics_Gdi`, `Win32_Graphics_Dwm`, `Win32_UI_HiDpi`, `Win32_UI_WindowsAndMessaging`) | GDI capture, DPI awareness, DWM bounds, window enumeration |
+| `capture-linux` | `x11rb` 0.14 (`image`, `randr`) | X11 RandR/GetImage capture and EWMH snap |
 | `tools/capture-cli` | `arboard` 3 (Windows clipboard), `clap` 4 | CLI UX + clipboard demo |
 
 Other Rust deps across the workspace: `thiserror`, `png`, `clap`, `arboard`,
@@ -248,14 +250,14 @@ two `extern "system"` callbacks; there is no `unsafe` in any domain crate.
 
 ## 8. Tests
 
-`cargo test --workspace` → **49 unit tests, 0 failures, 0 warnings.**
+`cargo test --workspace` → **65 unit tests on Windows, 67 on Linux, 0 failures, 0 warnings.**
 
 | crate | tests | covers |
 |---|---|---|
-| `capture-core` | 35 | geometry ops, negative coords, clamp/translate/inflate/union, coordinate mapper, pixel formats, BGRA→RGBA, snap ranking, toolbar placement (incl. bottom/top/fullscreen/tiny/negative-monitor/clamp + a sweep property test) |
-| `capture-annotation` | 6 | session transitions Idle→…→Editing→Idle, default full-frame commit, snap-candidate preview+commit, pen/rect append, undo |
-| `capture-render` | 5 | crop copy, negative-origin crop, deterministic pen, **golden checksum**, PNG header |
-| `capture-actions` | 3 | copy PNG payload, save writes file, stable ids |
+| `capture-core` | 44 | geometry overflow/negative coords, mixed-DPI mapping, pixel formats/stride/crop, snap Z-order, toolbar placement, selection geometry |
+| `capture-annotation` | 9 | session lifecycle, candidate switching, move/resize, annotation clamping, unified undo/redo, structured errors |
+| `capture-render` | 7 | crop copy, negative-origin crop, deterministic pen, **golden checksum**, PNG header, safe save replacement/failure |
+| `capture-actions` | 4 | copy PNG payload, save writes file, stable IDs, Save registry |
 
 `docs/architecture/*` and `docs/adr/*` are part of the frozen tree.
 
@@ -297,7 +299,7 @@ $ capture-cli render-test
   render-test: 80x48 checksum=0x40DC0DDD09DFFF4B            ← matches unit golden exactly
 
 $ capture-cli session-test 0
-  session-test: monitor=0 -> 2560x1440 annotations=1 checksum=0x2D7AA8F88787A014 capture_latency=11.7µs
+  session-test: monitor=0 -> 2560x1440 annotations=1 checksum=0xDD04953CAE4C2B64 capture_latency=346.5102ms
 
 $ capture-cli save 0 out.png / pin 0 out.png / ask-ai 0 out.png / copy 0 --clipboard
   save from shared SaveAction; pin/ask-ai payloads written; clipboard -> OK
@@ -315,11 +317,10 @@ the two frontends will use.
   `capture-cli capture-monitor 1` (2560×1440). This includes process startup
   (roughly 50–80 ms) plus GDI capture plus PNG encode (~900 KB). It is a
   whole-operation number, not a pure capture number.
-- **Session T1−T0:** the in-session `Timing` measured 11.7 µs for the
-  `Begin → FrameReady` application; note this only brackets command application —
-  the backend capture happens *before* `FrameReady` is delivered. The true
-  backend capture latency is what a frontend measures at the `capture_monitor`
-  call site (see below).
+- **Session T1−T0:** the CLI sends `Begin` before monitor resolution and the
+  actual `capture_monitor` call, then sends `FrameReady`; the reported timing
+  therefore includes the real backend capture. A frontend should use the same
+  ordering and record T2/T3/T4 separately.
 - **`capture_latency = T1 − T0`** is meant to be measured around the actual
   capture, with `T0` at hotkey and `T1` when the frame is ready. The Core exposes
   `Timing { t0_hotkey_received, t1_frame_ready }` and
@@ -341,11 +342,12 @@ the two frontends will use.
    can appear black under GDI `BitBlt`. Deferred to a DXGI/WGC route (ADR-0001).
 2. **Capture is not realtime:** `capture-monitor` is a one-shot; frontends must
    not expect a high-FPS backend preview (they preview from their own surface).
-3. **Snap Z-order precision:** window candidates follow OS `EnumWindows` Z-order
-   on Windows; `rank_candidates` is a shared fallback and may reorder by area in
-   edge cases. Element-level snapping is not implemented (`element_level=false`).
-4. **Linux is a route, not a deliverable** (see §5). No real capture was run on
-   this (Windows) host.
+3. **Snap scope:** window candidates follow OS `EnumWindows` Z-order on Windows;
+   area is only a deterministic tie-break when the platform gives equal order.
+   Element-level snapping is not implemented (`element_level=false`).
+4. **Linux runtime verification is environment-dependent** (see §5). The X11
+   route is implemented, but no Linux display server was available on this
+   Windows host; native Wayland still requires the portal/PipeWire bridge.
 5. **Clipboard:** `capture-actions` produces payloads only; the OS clipboard
    write is the caller's job. The CLI demonstrates it via `arboard`, which works
    in a console process subject to OLE/STA behavior on the caller side.
@@ -364,7 +366,7 @@ the two frontends will use.
    `capture-actions`.
 2. **Select a platform** (one line, OS-conditional):
    ```rust
-   #[cfg(windows)] let platform = capture_windows::WindowsPlatform::new();
+   #[cfg(windows)] let platform = capture_windows::WindowsPlatform::new()?;
    #[cfg(target_os = "linux")] let platform = capture_linux::LinuxPlatform::new();
    let capture: &dyn CaptureBackend = platform.capture_backend();
    let snap:     &dyn SnapBackend   = platform.snap_backend();
@@ -414,9 +416,9 @@ so a pinned image is never highlighted.
 ## 14. Completed standards (spec §23)
 
 - [x] CLI verifiable (above)
-- [x] tests pass (`cargo test --workspace`, 49 tests, 0 warnings)
-- [x] frozen tag produced: `demo-core-v1`
-- [x] Core API is a stable, documented contract the two UI agents start from
+- [x] historical baseline tag produced: `demo-core-v1`
+- [x] post-review repair set passes workspace tests, format, and Clippy
+- [ ] new repaired API tag (requires explicit release/commit decision)
 
 ## 15. If the Core API blocks a frontend
 
@@ -424,3 +426,24 @@ Do **not** fork Core per-branch. Add a `CORE_CHANGE_REQUEST.md` (template in
 `docs/CORE_CHANGE_REQUEST_TEMPLATE.md`) describing what is missing, whether both
 frontends need it, why it cannot be solved in the adapter, and the minimal API
 change. After the Core updates, both branches re-sync to a new shared tag.
+
+## 16. Post-review repair set (current working tree)
+
+The current untagged working tree addresses the defects found during review:
+
+- physical virtual-desktop capture uses the actual negative virtual origin;
+- monitor IDs derive from stable device names, and monitor work areas are exposed;
+- virtual-desktop capture is part of the backend contract and CLI;
+- DWM visual bounds, cloaked/minimized filtering, and platform Z-order feed snap ranking;
+- session candidate switching, crop move/resize, tool events, annotation clipping,
+  and unified crop-plus-annotation Undo/Redo are implemented;
+- all frame formats normalize through validated, checked conversion;
+- structured `CaptureError` events replace string-only session failures;
+- PNG output is staged beside the destination and preserves the old file on
+  encode/write failure;
+- mixed-DPI rectangles can be split into monitor-local logical segments;
+- CI runs format, Clippy, tests, and release builds on Linux and Windows.
+
+The remaining deliberate boundaries are GDI's protected-content limitation,
+native Wayland portal/PipeWire integration, and the absence of the separate
+Slint/QML frontend applications in this workspace.

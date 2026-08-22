@@ -33,6 +33,10 @@ pub struct SnapCandidate {
     pub bounds: PhysicalRect,
     pub kind: SnapKind,
     pub label: Option<String>,
+    /// Lower values are closer to the top of the platform's z-order.
+    /// `u32::MAX` is reserved for candidates without a platform z-order, such
+    /// as the desktop fallback.
+    pub z_order: u32,
 }
 
 /// Static capabilities of a snap backend.
@@ -77,11 +81,12 @@ pub fn rank_candidates(
     point: PhysicalPoint,
     mut candidates: Vec<SnapCandidate>,
 ) -> Vec<SnapCandidate> {
-    // Prefer window-level over desktop, then by descending area (larger windows
-    // win ties), then by containing the point first.
+    // Prefer candidates containing the point, then windows over the desktop,
+    // then the platform-provided z-order. Area is only a deterministic fallback
+    // when two candidates have the same z-order.
     candidates.sort_by(|a, b| {
-        let a_hit = a.bounds.contains(point) as u8;
-        let b_hit = b.bounds.contains(point) as u8;
+        let a_hit = a.bounds.contains_exclusive(point) as u8;
+        let b_hit = b.bounds.contains_exclusive(point) as u8;
         let a_kind = (a.kind == SnapKind::Window) as u8;
         let b_kind = (b.kind == SnapKind::Window) as u8;
         let a_area = a.bounds.area();
@@ -89,6 +94,7 @@ pub fn rank_candidates(
         b_hit
             .cmp(&a_hit)
             .then(b_kind.cmp(&a_kind))
+            .then(a.z_order.cmp(&b.z_order))
             .then(b_area.cmp(&a_area))
     });
     candidates
@@ -107,6 +113,7 @@ mod tests {
             ),
             kind: SnapKind::Window,
             label: Some(label.to_string()),
+            z_order: 0,
         }
     }
 
@@ -116,10 +123,7 @@ mod tests {
         let window_inside = win(50, 50, 200, 200, "inside");
         let window_outside = win(500, 500, 200, 200, "outside");
 
-        let ranked = rank_candidates(
-            point,
-            vec![window_outside.clone(), window_inside.clone()],
-        );
+        let ranked = rank_candidates(point, vec![window_outside.clone(), window_inside.clone()]);
         assert_eq!(ranked[0].label, Some("inside".to_string()));
     }
 
@@ -143,9 +147,21 @@ mod tests {
             ),
             kind: SnapKind::Desktop,
             label: None,
+            z_order: u32::MAX,
         };
         let window = win(0, 0, 100, 100, "w");
         let ranked = rank_candidates(point, vec![desktop, window.clone()]);
         assert_eq!(ranked[0].label, Some("w".to_string()));
+    }
+
+    #[test]
+    fn platform_z_order_beats_area_when_windows_overlap() {
+        let point = PhysicalPoint::new(100, 100);
+        let mut top = win(0, 0, 200, 200, "top");
+        top.z_order = 2;
+        let mut underneath = win(0, 0, 300, 300, "underneath");
+        underneath.z_order = 8;
+        let ranked = rank_candidates(point, vec![underneath, top]);
+        assert_eq!(ranked[0].label.as_deref(), Some("top"));
     }
 }

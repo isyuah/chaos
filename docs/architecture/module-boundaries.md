@@ -45,9 +45,10 @@ UI-neutral, platform-neutral, toolkit-free. The canonical coordinate space is
 - `geometry` — `PhysicalPoint`, `PhysicalSize`, `PhysicalRect`, `ScaleFactor`,
   plus `intersection`, `clamp`, `translate`, `contains`, `inflate`, `normalize`,
   and negative-virtual-coordinate helpers.
-- `coord` — `CoordinateMapper` and the physical↔logical contract for mixed-DPI.
-- `capture` — `PixelFormat`, `CapturedFrame`, `MonitorId`, `MonitorInfo`,
-  `CaptureCapabilities`, `CaptureError`.
+- `coord` — `CoordinateMapper`, `VirtualDesktopMapper`, and the physical↔logical
+  contract for mixed-DPI.
+- `capture` — `PixelFormat`, `CapturedFrame`, `MonitorId`, `MonitorInfo`
+  (including work area), `CaptureCapabilities`, `CaptureError`.
 - `snap` — `SnapKind`, `SnapCandidateId`, `SnapCandidate`, `SnapCapabilities`,
   `SnapError`, `SnapExclusionToken`.
 - `placement` — `place_toolbar`, `ToolbarPlacement`, `ToolbarPlacementReason`.
@@ -56,7 +57,8 @@ UI-neutral, platform-neutral, toolkit-free. The canonical coordinate space is
 
 ### `capture-platform-api`
 The formal abstraction surface. Defines `CaptureBackend` and `SnapBackend`
-traits. Uses only `capture-core` types. No implementation code.
+traits, including optional atomic virtual-desktop capture. Uses only
+`capture-core` types. No implementation code.
 
 ### `capture-annotation`
 The annotation document (`Annotation`, `PenStroke`, `RectShape`,
@@ -86,9 +88,11 @@ Implements `CaptureBackend` (GDI `BitBlt` screen capture) and `SnapBackend`
 all `HWND`/`HDC` handling is confined here.
 
 ### `capture-linux`
-Provides the same two traits behind `#[cfg(target_os = "linux")]`. For the demo
-it is a compilable skeleton that documents the X11/Wayland route and returns
-clear `CaptureError::Unsupported` results rather than silently misbehaving.
+Provides the same two traits behind `#[cfg(target_os = "linux")]`. X11 uses
+RandR 1.5 monitor enumeration, root-window `GetImage` capture, and EWMH client
+stacking/window geometry for snap candidates. Wayland is detected explicitly and
+returns an actionable `Unsupported` result until a frontend supplies the
+XDG ScreenCast portal/PipeWire bridge.
 
 ## 3. What each frontend implements (NOT in Core)
 
@@ -113,8 +117,9 @@ A frontend:
    `capture-linux::LinuxPlatform` elsewhere (the CLI's `platform` module shows
    the one-line wiring).
 3. Consumes `CaptureBackend`/`SnapBackend` through `&dyn` (they are object-safe).
-4. Passes its native window handle into `SnapBackend::set_excluded_window` as a
-   `SnapExclusionToken` derived from its HWND value.
+4. Passes all native overlay and Pin window handles into
+   `SnapBackend::set_excluded_windows` as `SnapExclusionToken` values. The
+   singular setter is retained for one-window integrations.
 
 If the frozen Core API blocks a reasonable implementation, the frontend
 follows `CORE_CHANGE_REQUEST.md` instead of silently forking Core.

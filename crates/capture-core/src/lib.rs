@@ -23,15 +23,15 @@ pub use action::ActionId;
 pub use capture::{
     CaptureCapabilities, CaptureError, CapturedFrame, MonitorId, MonitorInfo, PixelFormat, Timing,
 };
-pub use coord::CoordinateMapper;
+pub use coord::{CoordinateMapper, VirtualDesktopMapper};
 pub use geometry::{
     LogicalPoint, LogicalRect, LogicalSize, PhysicalPoint, PhysicalRect, PhysicalSize, ScaleFactor,
 };
 pub use placement::{place_toolbar, ToolbarPlacement, ToolbarPlacementReason};
 pub use selection::{ResizeHandle, SelectionInteraction, SelectionSession};
 pub use snap::{
-    rank_candidates, SnapCandidate, SnapCandidateId, SnapCapabilities, SnapError, SnapExclusionToken,
-    SnapKind,
+    rank_candidates, SnapCandidate, SnapCandidateId, SnapCapabilities, SnapError,
+    SnapExclusionToken, SnapKind,
 };
 
 /// Version banner printed by the CLI / used by tests to confirm the Core build.

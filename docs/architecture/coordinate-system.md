@@ -10,9 +10,9 @@ single global virtual-desktop origin.
   left of, or above, the primary monitor.
 - `PhysicalPoint` uses `i32`; `PhysicalSize` uses `u32` (width/height are
   non-negative).
-- A `PhysicalRect` is stored as `origin: PhysicalPoint` + `size: PhysicalSize`
-  and is always **finalized** by `normalized()` converting any potentially
-  inverted (drag) rectangle into a canonical top-left + positive size.
+- A `PhysicalRect` is stored as `origin: PhysicalPoint` + `size: PhysicalSize`.
+  Drag corners are normalized through `from_points`; an empty rect is allowed
+  as an intermediate state before commit.
 - `ScaleFactor` is an `f64` describing physical pixels per logical pixel.
 
 ## 2. Types
@@ -48,6 +48,11 @@ impl CoordinateMapper {
 }
 ```
 
+`VirtualDesktopMapper` resolves a physical point to a monitor-local logical
+surface and can split a physical selection at monitor boundaries. It does not
+invent one continuous logical desktop: neighboring displays can use different
+scale factors, so physical coordinates remain the source of truth.
+
 Mappings are pure arithmetic on the single `scale_factor` of the monitor the
 pointer is currently over; they do not attempt any cross-monitor scale
 interpolation. Because coordinates are integer physical pixels on input and the
@@ -57,15 +62,15 @@ toolkit's float logical space for display.
 
 ## 4. Capture source alignment
 
-A `CapturedFrame` is captured from the whole virtual desktop and then cropped to
-the requested monitor. Its `origin` is the monitor's virtual top-left
-(`PhysicalRect` negative-origin aware), and its pixels are the monitor's
-physical-pixel content. Therefore:
+A Windows capture first obtains one atomic full virtual-desktop frame and then
+crops it for a monitor request. Its `origin` is the virtual desktop's physical
+top-left. A monitor frame returned by `capture_monitor` has the monitor's
+virtual top-left and only that monitor's physical-pixel content. Therefore:
 
 ```
-frame.origin == monitor.bounds.origin
-frame.width  == monitor.bounds.size.width
-frame.height == monitor.bounds.size.height
+monitor_frame.origin == monitor.bounds.origin
+monitor_frame.width  == monitor.bounds.size.width
+monitor_frame.height == monitor.bounds.size.height
 ```
 
 ## 5. DPI-awareness requirement

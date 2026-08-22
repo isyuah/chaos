@@ -18,10 +18,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(windows)]
-use capture_windows::WindowsPlatform;
 #[cfg(target_os = "linux")]
 use capture_linux::LinuxPlatform;
+#[cfg(windows)]
+use capture_windows::WindowsPlatform;
 
 #[derive(Parser)]
 #[command(
@@ -41,9 +41,14 @@ enum Command {
     Monitors,
     /// Capture a monitor's pixels and write a PNG.
     CaptureMonitor {
-        #[arg(help = "monitor id from `monitors`")]
-        id: u32,
+        #[arg(help = "stable monitor id from `monitors`, or its listed ordinal")]
+        id: u64,
         #[arg(long, help = "output PNG; defaults to ./capture-monitor-<id>.png")]
+        output: Option<PathBuf>,
+    },
+    /// Capture one atomic physical frame of the complete virtual desktop.
+    CaptureVirtualDesktop {
+        #[arg(long, help = "output PNG; defaults to ./capture-virtual-desktop.png")]
         output: Option<PathBuf>,
     },
     /// Report the snap candidates under a point.
@@ -55,7 +60,13 @@ enum Command {
     },
     /// Run the toolbar-placement battery (or one placement) and print results.
     TestToolbarPlacement {
-        #[arg(long, num_args = 4, allow_hyphen_values = true, value_name = "x y w h", help = "run one placement: selection")]
+        #[arg(
+            long,
+            num_args = 4,
+            allow_hyphen_values = true,
+            value_name = "x y w h",
+            help = "run one placement: selection"
+        )]
         selection: Option<Vec<i32>>,
         #[arg(long, num_args = 2, value_name = "w h", help = "toolbar size")]
         toolbar: Option<Vec<u32>>,
@@ -70,34 +81,25 @@ enum Command {
     /// Drive the real session flow (capture → select → annotate → render).
     SessionTest {
         #[arg(default_value_t = 0)]
-        monitor: u32,
+        monitor: u64,
         #[arg(long)]
         output: Option<PathBuf>,
     },
     /// Copy: produce the PNG payload; optionally write to the OS clipboard.
     Copy {
         #[arg(default_value_t = 0)]
-        monitor: u32,
+        monitor: u64,
         #[arg(long)]
         clipboard: bool,
         #[arg(long)]
         output: Option<PathBuf>,
     },
     /// Save: write the flattened document to a PNG using the shared Save action.
-    Save {
-        monitor: u32,
-        output: PathBuf,
-    },
+    Save { monitor: u64, output: PathBuf },
     /// Pin: produce the Pin payload (frontend would open the Pin window).
-    Pin {
-        monitor: u32,
-        output: PathBuf,
-    },
+    Pin { monitor: u64, output: PathBuf },
     /// AskAI: produce the payload to hand to an external consumer (stub).
-    AskAi {
-        monitor: u32,
-        output: PathBuf,
-    },
+    AskAi { monitor: u64, output: PathBuf },
     /// Validate the Core API version.
     SelfTest,
 }
@@ -130,15 +132,19 @@ impl HostPlatform {
     }
 }
 
-fn make_host() -> HostPlatform {
+fn make_host() -> Result<HostPlatform, String> {
     #[cfg(windows)]
     {
-        return HostPlatform::Windows(WindowsPlatform::new());
+        return WindowsPlatform::new()
+            .map(HostPlatform::Windows)
+            .map_err(|error| error.to_string());
     }
     #[cfg(target_os = "linux")]
     {
-        return HostPlatform::Linux(LinuxPlatform::new());
+        return Ok(HostPlatform::Linux(LinuxPlatform::new()));
     }
+    #[allow(unreachable_code)]
+    Err("capture-cli has no backend for this target".to_string())
 }
 
 fn main() {
@@ -153,6 +159,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Monitors => cmd_monitors(),
         Command::CaptureMonitor { id, output } => cmd_capture(id, output),
+        Command::CaptureVirtualDesktop { output } => cmd_capture_virtual_desktop(output),
         Command::CandidatesAt { x, y, exclude } => cmd_candidates(x, y, exclude),
         Command::TestToolbarPlacement {
             selection,
@@ -174,24 +181,28 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn cmd_monitors() -> Result<(), String> {
-    let host = make_host();
+    let host = make_host()?;
     let backends = host.capture();
     let caps = backends.capabilities();
     println!(
-        "capabilities: multi_monitor={} per_monitor_dpi={} capture_window={}",
-        caps.multi_monitor, caps.per_monitor_dpi, caps.capture_window
+        "capabilities: multi_monitor={} per_monitor_dpi={} virtual_desktop={} capture_window={}",
+        caps.multi_monitor, caps.per_monitor_dpi, caps.capture_virtual_desktop, caps.capture_window
     );
     let monitors = backends.monitors().map_err(|e| format!("{e}"))?;
     println!("monitors: {}", monitors.len());
-    for m in &monitors {
+    for (ordinal, m) in monitors.iter().enumerate() {
         println!(
-            "  [{}] {} bounds=({},{} {}x{}) scale={} primary={}",
+            "  [ordinal={ordinal} id={}] {} bounds=({},{} {}x{}) work_area=({},{} {}x{}) scale={} primary={}",
             m.id.index(),
             m.name,
             m.bounds.origin.x,
             m.bounds.origin.y,
             m.bounds.size.width,
             m.bounds.size.height,
+            m.work_area.origin.x,
+            m.work_area.origin.y,
+            m.work_area.size.width,
+            m.work_area.size.height,
             m.scale_factor.get(),
             m.is_primary
         );
@@ -199,18 +210,16 @@ fn cmd_monitors() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_capture(id: u32, output: Option<PathBuf>) -> Result<(), String> {
-    let host = make_host();
-    let frame = host
-        .capture()
-        .capture_monitor(MonitorId::new(id))
+fn cmd_capture(id: u64, output: Option<PathBuf>) -> Result<(), String> {
+    let host = make_host()?;
+    let backend = host.capture();
+    let monitor_id = resolve_monitor_id(backend, id)?;
+    let frame = backend
+        .capture_monitor(monitor_id)
         .map_err(|e| format!("{e}"))?;
     frame.validate().map_err(|e| format!("{e}"))?;
-    let image = RenderedImage::new(
-        frame.width,
-        frame.height,
-        frame.pixels.to_vec(),
-    );
+    let frame = frame.to_rgba8().map_err(|error| error.to_string())?;
+    let image = RenderedImage::new(frame.width, frame.height, frame.pixels.to_vec());
     let path = output.unwrap_or_else(|| PathBuf::from(format!("./capture-monitor-{id}.png")));
     save_png(&path, &image).map_err(|e| format!("{e}"))?;
     println!(
@@ -224,8 +233,30 @@ fn cmd_capture(id: u32, output: Option<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_capture_virtual_desktop(output: Option<PathBuf>) -> Result<(), String> {
+    let host = make_host()?;
+    let frame = host
+        .capture()
+        .capture_virtual_desktop()
+        .map_err(|error| error.to_string())?;
+    frame.validate().map_err(|error| error.to_string())?;
+    let frame = frame.to_rgba8().map_err(|error| error.to_string())?;
+    let image = RenderedImage::new(frame.width, frame.height, frame.pixels.to_vec());
+    let path = output.unwrap_or_else(|| PathBuf::from("./capture-virtual-desktop.png"));
+    save_png(&path, &image).map_err(|error| error.to_string())?;
+    println!(
+        "captured virtual desktop: {}x{} origin=({},{}) -> {}",
+        frame.width,
+        frame.height,
+        frame.origin.x,
+        frame.origin.y,
+        path.display()
+    );
+    Ok(())
+}
+
 fn cmd_candidates(x: i32, y: i32, exclude: Option<u64>) -> Result<(), String> {
-    let host = make_host();
+    let host = make_host()?;
     let snap = host.snap();
     if let Some(hwnd) = exclude {
         snap.set_excluded_window(Some(capture_core::SnapExclusionToken::new(hwnd)));
@@ -235,8 +266,9 @@ fn cmd_candidates(x: i32, y: i32, exclude: Option<u64>) -> Result<(), String> {
     println!("candidates-at ({x},{y}): {}", cands.len());
     for c in &cands {
         println!(
-            "  id={} kind={:?} bounds=({},{},{}x{}) label={:?}",
+            "  id={} z_order={} kind={:?} bounds=({},{},{}x{}) label={:?}",
             c.id.get(),
+            c.z_order,
             c.kind,
             c.bounds.origin.x,
             c.bounds.origin.y,
@@ -266,11 +298,7 @@ fn cmd_test_toolbar(args: (Option<Vec<i32>>, Option<Vec<u32>>, Option<u32>)) -> 
         let p = capture_core::place_toolbar(selection, toolbar, work_area, gap.unwrap_or(8));
         println!(
             "placement: rect=({},{},{}x{}) reason={:?}",
-            p.rect.origin.x,
-            p.rect.origin.y,
-            p.rect.size.width,
-            p.rect.size.height,
-            p.reason
+            p.rect.origin.x, p.rect.origin.y, p.rect.size.width, p.rect.size.height, p.reason
         );
         return Ok(());
     }
@@ -283,40 +311,87 @@ fn cmd_test_toolbar(args: (Option<Vec<i32>>, Option<Vec<u32>>, Option<u32>)) -> 
         }
     };
 
-    let work = || PhysicalRect::new(PhysicalPoint::new(0, 0), capture_core::PhysicalSize::new(1920, 1040));
+    let work = || {
+        PhysicalRect::new(
+            PhysicalPoint::new(0, 0),
+            capture_core::PhysicalSize::new(1920, 1040),
+        )
+    };
     let tb = |w: u32, h: u32| capture_core::PhysicalSize::new(w, h);
 
     // below in middle
     {
-        let sel = PhysicalRect::new(PhysicalPoint::new(400, 300), capture_core::PhysicalSize::new(800, 300));
+        let sel = PhysicalRect::new(
+            PhysicalPoint::new(400, 300),
+            capture_core::PhysicalSize::new(800, 300),
+        );
         let p = capture_core::place_toolbar(sel, tb(320, 40), work(), 8);
-        check("below_middle", p.reason == capture_core::ToolbarPlacementReason::Below && p.rect.origin.y == sel.bottom() + 8, format!("{:?}", p));
+        check(
+            "below_middle",
+            p.reason == capture_core::ToolbarPlacementReason::Below
+                && p.rect.origin.y == sel.bottom() + 8,
+            format!("{:?}", p),
+        );
     }
     // above at bottom
     {
-        let sel = PhysicalRect::new(PhysicalPoint::new(400, 900), capture_core::PhysicalSize::new(800, 100));
+        let sel = PhysicalRect::new(
+            PhysicalPoint::new(400, 900),
+            capture_core::PhysicalSize::new(800, 100),
+        );
         let p = capture_core::place_toolbar(sel, tb(320, 40), work(), 8);
-        check("above_bottom", p.reason == capture_core::ToolbarPlacementReason::Above, format!("{:?}", p));
+        check(
+            "above_bottom",
+            p.reason == capture_core::ToolbarPlacementReason::Above,
+            format!("{:?}", p),
+        );
     }
     // inside bottom for full-screen
     {
-        let sel = PhysicalRect::new(PhysicalPoint::new(0, 0), capture_core::PhysicalSize::new(1920, 1040));
+        let sel = PhysicalRect::new(
+            PhysicalPoint::new(0, 0),
+            capture_core::PhysicalSize::new(1920, 1040),
+        );
         let p = capture_core::place_toolbar(sel, tb(320, 40), work(), 8);
-        check("inside_fullscreen", p.reason == capture_core::ToolbarPlacementReason::InsideBottom, format!("{:?}", p));
+        check(
+            "inside_fullscreen",
+            p.reason == capture_core::ToolbarPlacementReason::InsideBottom,
+            format!("{:?}", p),
+        );
     }
     // tiny selection
     {
-        let sel = PhysicalRect::new(PhysicalPoint::new(960, 500), capture_core::PhysicalSize::new(2, 2));
+        let sel = PhysicalRect::new(
+            PhysicalPoint::new(960, 500),
+            capture_core::PhysicalSize::new(2, 2),
+        );
         let p = capture_core::place_toolbar(sel, tb(320, 40), work(), 8);
-        check("tiny_below", p.reason == capture_core::ToolbarPlacementReason::Below, format!("{:?}", p));
+        check(
+            "tiny_below",
+            p.reason == capture_core::ToolbarPlacementReason::Below,
+            format!("{:?}", p),
+        );
     }
     // negative-origin monitor
     {
-        let wa = PhysicalRect::new(PhysicalPoint::new(-1920, 0), capture_core::PhysicalSize::new(1920, 1040));
-        let sel = PhysicalRect::new(PhysicalPoint::new(-1600, 400), capture_core::PhysicalSize::new(600, 200));
+        let wa = PhysicalRect::new(
+            PhysicalPoint::new(-1920, 0),
+            capture_core::PhysicalSize::new(1920, 1040),
+        );
+        let sel = PhysicalRect::new(
+            PhysicalPoint::new(-1600, 400),
+            capture_core::PhysicalSize::new(600, 200),
+        );
         let p = capture_core::place_toolbar(sel, tb(320, 40), wa, 8);
-        let in_bounds = p.rect.origin.x >= wa.origin.x && p.rect.right() <= wa.right() && p.rect.origin.y >= wa.origin.y && p.rect.bottom() <= wa.bottom();
-        check("negative_origin_inside", p.reason == capture_core::ToolbarPlacementReason::Below && in_bounds, format!("{:?}", p));
+        let in_bounds = p.rect.origin.x >= wa.origin.x
+            && p.rect.right() <= wa.right()
+            && p.rect.origin.y >= wa.origin.y
+            && p.rect.bottom() <= wa.bottom();
+        check(
+            "negative_origin_inside",
+            p.reason == capture_core::ToolbarPlacementReason::Below && in_bounds,
+            format!("{:?}", p),
+        );
     }
     if all_ok {
         println!("toolbar placement battery: ALL PASS");
@@ -330,10 +405,16 @@ fn cmd_render_test(output: PathBuf) -> Result<(), String> {
     let frame = make_test_frame(96, 64, 0x3C);
     let mut doc = CaptureDocument::new(
         Arc::new(frame),
-        PhysicalRect::new(PhysicalPoint::new(8, 8), capture_core::PhysicalSize::new(80, 48)),
+        PhysicalRect::new(
+            PhysicalPoint::new(8, 8),
+            capture_core::PhysicalSize::new(80, 48),
+        ),
     );
     doc.annotations.push(Annotation::Rectangle(RectShape::new(
-        PhysicalRect::new(PhysicalPoint::new(12, 12), capture_core::PhysicalSize::new(40, 24)),
+        PhysicalRect::new(
+            PhysicalPoint::new(12, 12),
+            capture_core::PhysicalSize::new(40, 24),
+        ),
         Color::BLUE,
         3,
         Some(Color::new(255, 0, 0, 128)),
@@ -341,25 +422,33 @@ fn cmd_render_test(output: PathBuf) -> Result<(), String> {
     doc.annotations.push(Annotation::Pen(PenStroke {
         color: Color::YELLOW,
         thickness: 4,
-        points: vec![PhysicalPoint::new(20, 20), PhysicalPoint::new(60, 20), PhysicalPoint::new(60, 50)],
+        points: vec![
+            PhysicalPoint::new(20, 20),
+            PhysicalPoint::new(60, 20),
+            PhysicalPoint::new(60, 50),
+        ],
     }));
     let image = flatten(&doc).map_err(|e| format!("{e}"))?;
     save_png(&output, &image).map_err(|e| format!("{e}"))?;
     println!(
         "render-test: {}x{} checksum=0x{:X} -> {}",
-        image.width, image.height, checksum(&image), output.display()
+        image.width,
+        image.height,
+        checksum(&image),
+        output.display()
     );
     Ok(())
 }
 
-fn cmd_session_test(monitor: u32, output: Option<PathBuf>) -> Result<(), String> {
-    let host = make_host();
-    let frame = host
-        .capture()
-        .capture_monitor(MonitorId::new(monitor))
-        .map_err(|e| format!("{e}"))?;
+fn cmd_session_test(monitor: u64, output: Option<PathBuf>) -> Result<(), String> {
+    let host = make_host()?;
+    let backend = host.capture();
     let mut session = CaptureSession::new();
     session.apply(CaptureCommand::Begin);
+    let monitor_id = resolve_monitor_id(backend, monitor)?;
+    let frame = backend
+        .capture_monitor(monitor_id)
+        .map_err(|e| format!("{e}"))?;
     session.apply(CaptureCommand::FrameReady(frame));
     // Commit the whole monitor as the selection.
     session.apply(CaptureCommand::CommitSelection);
@@ -400,13 +489,14 @@ fn cmd_session_test(monitor: u32, output: Option<PathBuf>) -> Result<(), String>
     Ok(())
 }
 
-fn cmd_copy(monitor: u32, clipboard: bool, output: Option<PathBuf>) -> Result<(), String> {
-    let host = make_host();
-    let frame = host
-        .capture()
-        .capture_monitor(MonitorId::new(monitor))
+fn cmd_copy(monitor: u64, clipboard: bool, output: Option<PathBuf>) -> Result<(), String> {
+    let host = make_host()?;
+    let backend = host.capture();
+    let monitor_id = resolve_monitor_id(backend, monitor)?;
+    let frame = backend
+        .capture_monitor(monitor_id)
         .map_err(|e| format!("{e}"))?;
-    let doc = doc_from_frame(frame);
+    let doc = doc_from_frame(frame)?;
     let outcome = CopyAction.invoke(&doc).map_err(|e| format!("{e}"))?;
     let payload = match outcome {
         capture_actions::ActionOutcome::Png(p) => p,
@@ -416,7 +506,10 @@ fn cmd_copy(monitor: u32, clipboard: bool, output: Option<PathBuf>) -> Result<()
     std::fs::write(&path, &payload.png_bytes).map_err(|e| format!("{e}"))?;
     println!(
         "copy: payload {}x{} {} bytes PNG -> {}",
-        payload.width, payload.height, payload.png_bytes.len(), path.display()
+        payload.width,
+        payload.height,
+        payload.png_bytes.len(),
+        path.display()
     );
     if clipboard {
         // Demonstrate clipboard dispatch: write raw RGBA.
@@ -429,14 +522,17 @@ fn cmd_copy(monitor: u32, clipboard: bool, output: Option<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn cmd_save(monitor: u32, output: PathBuf) -> Result<(), String> {
-    let host = make_host();
-    let frame = host
-        .capture()
-        .capture_monitor(MonitorId::new(monitor))
+fn cmd_save(monitor: u64, output: PathBuf) -> Result<(), String> {
+    let host = make_host()?;
+    let backend = host.capture();
+    let monitor_id = resolve_monitor_id(backend, monitor)?;
+    let frame = backend
+        .capture_monitor(monitor_id)
         .map_err(|e| format!("{e}"))?;
-    let doc = doc_from_frame(frame);
-    let outcome = SaveAction::new(&output).invoke(&doc).map_err(|e| format!("{e}"))?;
+    let doc = doc_from_frame(frame)?;
+    let outcome = SaveAction::new(&output)
+        .invoke(&doc)
+        .map_err(|e| format!("{e}"))?;
     match outcome {
         capture_actions::ActionOutcome::Saved(p) => println!("save: -> {}", p.display()),
         _ => return Err("save expected a Saved outcome".to_string()),
@@ -444,36 +540,48 @@ fn cmd_save(monitor: u32, output: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_pin(monitor: u32, output: PathBuf) -> Result<(), String> {
-    let host = make_host();
-    let frame = host
-        .capture()
-        .capture_monitor(MonitorId::new(monitor))
+fn cmd_pin(monitor: u64, output: PathBuf) -> Result<(), String> {
+    let host = make_host()?;
+    let backend = host.capture();
+    let monitor_id = resolve_monitor_id(backend, monitor)?;
+    let frame = backend
+        .capture_monitor(monitor_id)
         .map_err(|e| format!("{e}"))?;
-    let doc = doc_from_frame(frame);
+    let doc = doc_from_frame(frame)?;
     let outcome = PinAction.invoke(&doc).map_err(|e| format!("{e}"))?;
     match outcome {
         capture_actions::ActionOutcome::Pin(p) => {
             std::fs::write(&output, &p.png_bytes).map_err(|e| format!("{e}"))?;
-            println!("pin: payload {}x{} -> {}", p.width, p.height, output.display());
+            println!(
+                "pin: payload {}x{} -> {}",
+                p.width,
+                p.height,
+                output.display()
+            );
         }
         _ => return Err("pin expected a Pin payload".to_string()),
     }
     Ok(())
 }
 
-fn cmd_ask_ai(monitor: u32, output: PathBuf) -> Result<(), String> {
-    let host = make_host();
-    let frame = host
-        .capture()
-        .capture_monitor(MonitorId::new(monitor))
+fn cmd_ask_ai(monitor: u64, output: PathBuf) -> Result<(), String> {
+    let host = make_host()?;
+    let backend = host.capture();
+    let monitor_id = resolve_monitor_id(backend, monitor)?;
+    let frame = backend
+        .capture_monitor(monitor_id)
         .map_err(|e| format!("{e}"))?;
-    let doc = doc_from_frame(frame);
+    let doc = doc_from_frame(frame)?;
     let outcome = AskAiAction.invoke(&doc).map_err(|e| format!("{e}"))?;
     match outcome {
         capture_actions::ActionOutcome::AskAi(p) => {
             std::fs::write(&output, &p.png_bytes).map_err(|e| format!("{e}"))?;
-            println!("ask-ai: payload {}x{} (stub) -> {}", p.width, p.height, output.display());
+            println!(
+                "ask-ai: payload {}x{} (stub) -> {}",
+                p.width,
+                p.height,
+                output.display()
+            );
         }
         _ => return Err("ask-ai expected an AskAi payload".to_string()),
     }
@@ -481,7 +589,7 @@ fn cmd_ask_ai(monitor: u32, output: PathBuf) -> Result<(), String> {
 }
 
 fn cmd_self_test() -> Result<(), String> {
-    let host = make_host();
+    let host = make_host()?;
     let caps = host.capture().capabilities();
     println!("capture-cli self-test");
     println!("  core api version: {}", capture_core::CORE_API_VERSION);
@@ -494,9 +602,33 @@ fn cmd_self_test() -> Result<(), String> {
     Ok(())
 }
 
-fn doc_from_frame(frame: capture_core::CapturedFrame) -> CaptureDocument {
+fn resolve_monitor_id(backend: &dyn CaptureBackend, requested: u64) -> Result<MonitorId, String> {
+    let monitors = backend.monitors().map_err(|error| error.to_string())?;
+    if let Some(monitor) = monitors
+        .iter()
+        .find(|monitor| monitor.id.index() == requested)
+    {
+        return Ok(monitor.id);
+    }
+    if let Some(monitor) = monitors.get(requested as usize) {
+        return Ok(monitor.id);
+    }
+    let available = monitors
+        .iter()
+        .enumerate()
+        .map(|(ordinal, monitor)| format!("{ordinal}:{}", monitor.id.index()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "monitor {requested} not found; available ordinal:id values: {available}"
+    ))
+}
+
+fn doc_from_frame(frame: capture_core::CapturedFrame) -> Result<CaptureDocument, String> {
+    frame.validate().map_err(|error| error.to_string())?;
+    let frame = frame.to_rgba8().map_err(|error| error.to_string())?;
     let bounds = frame.bounds();
-    CaptureDocument::new(Arc::new(frame), bounds)
+    Ok(CaptureDocument::new(Arc::new(frame), bounds))
 }
 
 fn make_test_frame(w: u32, h: u32, fill: u8) -> capture_core::CapturedFrame {

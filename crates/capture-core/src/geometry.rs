@@ -4,6 +4,16 @@
 //! are integer-based and may be negative where a monitor sits to the left of or
 //! above the primary monitor. `Logical*` types exist only at the UI bridge.
 
+const fn saturating_i64_to_i32(value: i64) -> i32 {
+    if value > i32::MAX as i64 {
+        i32::MAX
+    } else if value < i32::MIN as i64 {
+        i32::MIN
+    } else {
+        value as i32
+    }
+}
+
 /// A point in physical-pixel coordinates relative to the global virtual desktop
 /// origin. Coordinates may be negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
@@ -22,16 +32,16 @@ impl PhysicalPoint {
     /// Component-wise add.
     pub const fn add(self, other: Self) -> Self {
         Self {
-            x: self.x + other.x,
-            y: self.y + other.y,
+            x: self.x.saturating_add(other.x),
+            y: self.y.saturating_add(other.y),
         }
     }
 
     /// Component-wise subtract.
     pub const fn sub(self, other: Self) -> Self {
         Self {
-            x: self.x - other.x,
-            y: self.y - other.y,
+            x: self.x.saturating_sub(other.x),
+            y: self.y.saturating_sub(other.y),
         }
     }
 }
@@ -78,8 +88,8 @@ impl PhysicalSize {
 
 /// A rectangle in physical-pixel coordinates. Stored as origin + size.
 ///
-/// A freshly constructed rect is always normalized so `origin` is the top-left
-/// and `size` is non-negative (use [`PhysicalRect::from_points`] for drags).
+/// `size` is always non-negative. Use [`PhysicalRect::from_points`] when the
+/// two corners may arrive in either order, such as a drag gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PhysicalRect {
     pub origin: PhysicalPoint,
@@ -101,18 +111,18 @@ impl PhysicalRect {
         Self {
             origin: PhysicalPoint::new(left, top),
             size: PhysicalSize::new(
-                (right - left).max(0) as u32,
-                (bottom - top).max(0) as u32,
+                (right as i64 - left as i64) as u32,
+                (bottom as i64 - top as i64) as u32,
             ),
         }
     }
 
     pub const fn right(self) -> i32 {
-        self.origin.x + self.size.width as i32
+        saturating_i64_to_i32(self.origin.x as i64 + self.size.width as i64)
     }
 
     pub const fn bottom(self) -> i32 {
-        self.origin.y + self.size.height as i32
+        saturating_i64_to_i32(self.origin.y as i64 + self.size.height as i64)
     }
 
     pub const fn left(self) -> i32 {
@@ -141,8 +151,8 @@ impl PhysicalRect {
 
     pub const fn center(self) -> PhysicalPoint {
         PhysicalPoint::new(
-            self.origin.x + (self.size.width as i32) / 2,
-            self.origin.y + (self.size.height as i32) / 2,
+            saturating_i64_to_i32(self.origin.x as i64 + self.size.width as i64 / 2),
+            saturating_i64_to_i32(self.origin.y as i64 + self.size.height as i64 / 2),
         )
     }
 
@@ -180,7 +190,10 @@ impl PhysicalRect {
     /// Translate the rect by `delta`.
     pub const fn translate(self, delta: PhysicalPoint) -> Self {
         Self {
-            origin: self.origin.add(delta),
+            origin: PhysicalPoint::new(
+                self.origin.x.saturating_add(delta.x),
+                self.origin.y.saturating_add(delta.y),
+            ),
             size: self.size,
         }
     }
@@ -189,22 +202,23 @@ impl PhysicalRect {
     /// into the range that keeps the rect's size; if the rect is larger than
     /// `bounds` in an axis, its size shrinks to fit that axis.
     pub fn clamp(self, bounds: Self) -> Self {
-        let w = self.size.width as i32;
-        let h = self.size.height as i32;
-        let bw = bounds.size.width as i32;
-        let bh = bounds.size.height as i32;
-
-        let (x, out_w) = if w >= bw {
+        let (x, out_w) = if self.size.width >= bounds.size.width {
             (bounds.origin.x, bounds.size.width)
         } else {
-            let max_x = bounds.right() - w;
-            (self.origin.x.clamp(bounds.origin.x, max_x), self.size.width)
+            let max_x = bounds.right() as i64 - self.size.width as i64;
+            (
+                saturating_i64_to_i32((self.origin.x as i64).clamp(bounds.origin.x as i64, max_x)),
+                self.size.width,
+            )
         };
-        let (y, out_h) = if h >= bh {
+        let (y, out_h) = if self.size.height >= bounds.size.height {
             (bounds.origin.y, bounds.size.height)
         } else {
-            let max_y = bounds.bottom() - h;
-            (self.origin.y.clamp(bounds.origin.y, max_y), self.size.height)
+            let max_y = bounds.bottom() as i64 - self.size.height as i64;
+            (
+                saturating_i64_to_i32((self.origin.y as i64).clamp(bounds.origin.y as i64, max_y)),
+                self.size.height,
+            )
         };
 
         Self::new(PhysicalPoint::new(x, y), PhysicalSize::new(out_w, out_h))
@@ -214,15 +228,21 @@ impl PhysicalRect {
     /// A deflation that would invert the rect collapses it to an empty rect at
     /// the clamped corner.
     pub fn inflate(self, amount: i32) -> Self {
-        let left = self.origin.x - amount;
-        let top = self.origin.y - amount;
-        let right = self.right() + amount;
-        let bottom = self.bottom() + amount;
+        let left = self.origin.x as i64 - amount as i64;
+        let top = self.origin.y as i64 - amount as i64;
+        let right = self.right() as i64 + amount as i64;
+        let bottom = self.bottom() as i64 + amount as i64;
         if left <= right && top <= bottom {
-            Self::from_points(PhysicalPoint::new(left, top), PhysicalPoint::new(right, bottom))
+            Self::from_points(
+                PhysicalPoint::new(saturating_i64_to_i32(left), saturating_i64_to_i32(top)),
+                PhysicalPoint::new(saturating_i64_to_i32(right), saturating_i64_to_i32(bottom)),
+            )
         } else {
             Self::new(
-                PhysicalPoint::new(left.min(right), top.min(bottom)),
+                PhysicalPoint::new(
+                    saturating_i64_to_i32(left.min(right)),
+                    saturating_i64_to_i32(top.min(bottom)),
+                ),
                 PhysicalSize::new(0, 0),
             )
         }
@@ -242,12 +262,38 @@ impl PhysicalRect {
         )
     }
 
-    /// The inset rectangle by the given amounts (values must be >= 0).
+    /// Inset the rectangle by the given non-negative amounts.
+    ///
+    /// If an inset exceeds the available space, the result collapses to an
+    /// empty rectangle instead of overflowing an unsigned subtraction.
     pub fn inset(self, left: u32, top: u32, right: u32, bottom: u32) -> Self {
-        let origin = PhysicalPoint::new(self.origin.x + left as i32, self.origin.y + top as i32);
-        let width = (self.width() - left - right).max(0);
-        let height = (self.height() - top - bottom).max(0);
+        let inset_left = left.min(self.width());
+        let inset_top = top.min(self.height());
+        let remaining_width = self.width() - inset_left;
+        let remaining_height = self.height() - inset_top;
+        let inset_right = right.min(remaining_width);
+        let inset_bottom = bottom.min(remaining_height);
+        let origin = PhysicalPoint::new(
+            saturating_i64_to_i32(self.origin.x as i64 + inset_left as i64),
+            saturating_i64_to_i32(self.origin.y as i64 + inset_top as i64),
+        );
+        let width = remaining_width - inset_right;
+        let height = remaining_height - inset_bottom;
         Self::new(origin, PhysicalSize::new(width, height))
+    }
+
+    /// Clamp a point into the rectangle's inclusive pixel range.
+    ///
+    /// Empty rectangles return their origin because they have no valid pixel
+    /// interior.
+    pub fn clamp_point(self, point: PhysicalPoint) -> PhysicalPoint {
+        if self.is_empty() {
+            return self.origin;
+        }
+        PhysicalPoint::new(
+            point.x.clamp(self.left(), self.right().saturating_sub(1)),
+            point.y.clamp(self.top(), self.bottom().saturating_sub(1)),
+        )
     }
 }
 
@@ -367,7 +413,10 @@ mod tests {
 
     #[test]
     fn intersection_overlap() {
-        assert_eq!(r(0, 0, 10, 10).intersection(r(5, 5, 10, 10)), Some(r(5, 5, 5, 5)));
+        assert_eq!(
+            r(0, 0, 10, 10).intersection(r(5, 5, 10, 10)),
+            Some(r(5, 5, 5, 5))
+        );
         assert_eq!(r(0, 0, 10, 10).intersection(r(10, 10, 10, 10)), None); // touching edges
         assert_eq!(r(-5, -5, 3, 3).intersection(r(0, 0, 10, 10)), None);
     }
@@ -429,5 +478,18 @@ mod tests {
         assert_eq!(ScaleFactor::new(1.25).sanitized(), 1.25);
         assert_eq!(ScaleFactor::new(0.0).sanitized(), 1.0);
         assert_eq!(ScaleFactor::new(f64::NAN).sanitized(), 1.0);
+    }
+
+    #[test]
+    fn inset_larger_than_rect_collapses_without_overflow() {
+        let out = r(10, 20, 4, 6).inset(100, 100, 100, 100);
+        assert_eq!(out, r(14, 26, 0, 0));
+    }
+
+    #[test]
+    fn clamp_point_uses_half_open_rect_interior() {
+        let rect = r(-10, -20, 10, 20);
+        assert_eq!(rect.clamp_point(p(-100, 100)), p(-10, -1));
+        assert_eq!(rect.clamp_point(p(100, -100)), p(-1, -20));
     }
 }

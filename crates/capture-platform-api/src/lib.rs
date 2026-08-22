@@ -24,12 +24,25 @@ pub trait CaptureBackend: Send + Sync {
     /// Capture the current contents of the given monitor as a physical-pixel
     /// [`CapturedFrame`].
     fn capture_monitor(&self, id: MonitorId) -> Result<CapturedFrame, CaptureError>;
+
+    /// Capture one atomic physical-pixel frame of the complete virtual desktop.
+    ///
+    /// Backends that cannot provide this operation should return
+    /// [`CaptureError::Unsupported`]. A frontend can use this operation for a
+    /// cross-monitor frozen overlay instead of stitching independently captured
+    /// monitor frames.
+    fn capture_virtual_desktop(&self) -> Result<CapturedFrame, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "virtual-desktop capture is not available on this backend".to_string(),
+        ))
+    }
 }
 
 /// A backend that can find windows/elements under a point for snap-to-window.
 ///
-/// The screenshotter must exclude its own overlay via [`SnapBackend::set_excluded_window`]
-/// before snapping so it never highlights itself.
+/// The screenshotter must exclude its own overlay and Pin windows via
+/// [`SnapBackend::set_excluded_windows`] before snapping so it never highlights
+/// itself.
 pub trait SnapBackend: Send + Sync {
     fn capabilities(&self) -> SnapCapabilities;
 
@@ -39,6 +52,16 @@ pub trait SnapBackend: Send + Sync {
     /// Set the opaque identity of a window to exclude from snapping. Re-entrant
     /// and thread-safe: notifies implementors, default is a no-op.
     fn set_excluded_window(&self, token: Option<SnapExclusionToken>) {
-        let _ = token;
+        let tokens = token.into_iter().collect::<Vec<_>>();
+        self.set_excluded_windows(&tokens);
+    }
+
+    /// Set all native windows that must be excluded from snapping.
+    ///
+    /// The singular method is retained for compatibility with existing
+    /// frontends. Implementations that support multiple overlay/pin windows
+    /// should override this method.
+    fn set_excluded_windows(&self, tokens: &[SnapExclusionToken]) {
+        let _ = tokens;
     }
 }

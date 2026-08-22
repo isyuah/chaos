@@ -7,9 +7,9 @@
 use crate::document::{Annotation, CaptureDocument, Color, PenStroke, RectShape};
 use crate::tools::AnnotationTool;
 use capture_core::action::ActionId;
-use capture_core::capture::{CapturedFrame, Timing};
+use capture_core::capture::{CaptureError, CapturedFrame, Timing};
 use capture_core::geometry::{PhysicalPoint, PhysicalRect};
-use capture_core::selection::{ResizeHandle, SelectionInteraction, SelectionSession};
+use capture_core::selection::{resize_rect, ResizeHandle, SelectionInteraction, SelectionSession};
 use capture_core::snap::SnapCandidate;
 use std::sync::Arc;
 
@@ -40,6 +40,7 @@ pub enum CaptureCommand {
     UpdateAnnotation(PhysicalPoint),
     EndAnnotation,
     Undo,
+    Redo,
     InvokeAction(ActionId),
     Cancel,
 }
@@ -51,9 +52,10 @@ pub enum CaptureEvent {
     SelectionChanged(PhysicalRect),
     SnapCandidateChanged(Option<SnapCandidate>),
     DocumentChanged,
+    ToolChanged(AnnotationTool),
     ActionRequested(ActionId),
     Completed,
-    Error(String),
+    Error(CaptureError),
 }
 
 const DEFAULT_PEN_THICKNESS: u32 = 3;
@@ -65,9 +67,15 @@ const DEFAULT_PEN_COLOR: Color = Color::RED;
 pub struct EditorSession {
     pub document: CaptureDocument,
     pub selected_tool: AnnotationTool,
-    undo_stack: Vec<Annotation>,
-    redo_stack: Vec<Annotation>,
+    undo_stack: Vec<EditorSnapshot>,
+    redo_stack: Vec<EditorSnapshot>,
     active: Option<ActiveAnnotation>,
+}
+
+#[derive(Debug, Clone)]
+struct EditorSnapshot {
+    crop: PhysicalRect,
+    annotations: Vec<Annotation>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +106,7 @@ impl EditorSession {
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.document.annotations.is_empty()
+        !self.undo_stack.is_empty()
     }
 
     pub fn can_redo(&self) -> bool {
@@ -146,9 +154,10 @@ impl EditorSession {
     }
 
     pub fn begin_annotation(&mut self, point: PhysicalPoint) {
-        if !self.document.crop.contains_exclusive(point) {
+        if self.document.crop.is_empty() {
             return;
         }
+        let point = self.document.crop.clamp_point(point);
         self.active = Some(match self.selected_tool {
             AnnotationTool::Pen => ActiveAnnotation::Pen {
                 points: vec![point],
@@ -166,6 +175,7 @@ impl EditorSession {
     }
 
     pub fn update_annotation(&mut self, point: PhysicalPoint) {
+        let point = self.document.crop.clamp_point(point);
         match &mut self.active {
             Some(ActiveAnnotation::Pen { points, .. }) => {
                 if let Some(last) = points.last() {
@@ -223,8 +233,8 @@ impl EditorSession {
         };
 
         if let Some(annotation) = finished {
+            self.record_history();
             self.document.push_annotation(annotation);
-            self.redo_stack.clear();
             true
         } else {
             false
@@ -232,9 +242,9 @@ impl EditorSession {
     }
 
     pub fn undo(&mut self) -> bool {
-        if let Some(prev) = self.document.annotations.pop() {
-            self.undo_stack.push(prev);
-            self.redo_stack.clear();
+        if let Some(previous) = self.undo_stack.pop() {
+            self.redo_stack.push(self.snapshot());
+            self.restore(previous);
             true
         } else {
             false
@@ -243,11 +253,39 @@ impl EditorSession {
 
     pub fn redo(&mut self) -> bool {
         if let Some(next) = self.redo_stack.pop() {
-            self.document.annotations.push(next);
+            self.undo_stack.push(self.snapshot());
+            self.restore(next);
             true
         } else {
             false
         }
+    }
+
+    fn snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            crop: self.document.crop,
+            annotations: self.document.annotations.clone(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: EditorSnapshot) {
+        self.document.crop = snapshot.crop;
+        self.document.annotations = snapshot.annotations;
+        self.active = None;
+    }
+
+    fn record_history(&mut self) {
+        self.undo_stack.push(self.snapshot());
+        self.redo_stack.clear();
+    }
+
+    fn update_crop(&mut self, crop: PhysicalRect) -> bool {
+        if self.document.crop == crop {
+            return false;
+        }
+        self.record_history();
+        self.document.crop = crop;
+        true
     }
 }
 
@@ -309,10 +347,31 @@ impl CaptureSession {
     ) -> (CaptureSessionState, Vec<CaptureEvent>) {
         match (state, cmd) {
             (CaptureSessionState::Idle, CaptureCommand::Begin) => {
+                self.current_frame = None;
+                self.hover_candidate = None;
+                self.timing.reset();
                 self.timing.mark_t0();
-                (CaptureSessionState::Preparing, vec![CaptureEvent::StateChanged])
+                (
+                    CaptureSessionState::Preparing,
+                    vec![CaptureEvent::StateChanged],
+                )
             }
             (CaptureSessionState::Preparing, CaptureCommand::FrameReady(frame)) => {
+                if let Err(error) = frame.validate() {
+                    return (
+                        CaptureSessionState::Preparing,
+                        vec![CaptureEvent::Error(error)],
+                    );
+                }
+                let frame = match frame.to_rgba8() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return (
+                            CaptureSessionState::Preparing,
+                            vec![CaptureEvent::Error(error)],
+                        )
+                    }
+                };
                 self.timing.mark_t1();
                 let bounds = frame.bounds();
                 let mut sel = SelectionSession::new();
@@ -339,21 +398,27 @@ impl CaptureSession {
             (CaptureSessionState::Selecting(sel), CaptureCommand::SnapCandidate(cand)) => {
                 self.hover_candidate = cand.clone();
                 let mut sel = sel;
+                let mut events = vec![CaptureEvent::SnapCandidateChanged(cand.clone())];
                 if let Some(c) = &cand {
-                    if !sel.is_active() || sel.interaction == SelectionInteraction::Idle {
-                        sel.rect = c.bounds.clamp(
-                            sel.clamp_bounds
-                                .unwrap_or_else(|| self.current_frame.as_ref().map(|f| f.bounds()).unwrap_or(c.bounds)),
-                        );
+                    if sel.interaction != SelectionInteraction::Dragging {
+                        let next_rect = c.bounds.clamp(sel.clamp_bounds.unwrap_or_else(|| {
+                            self.current_frame
+                                .as_ref()
+                                .map(|f| f.bounds())
+                                .unwrap_or(c.bounds)
+                        }));
+                        if sel.rect != next_rect {
+                            sel.rect = next_rect;
+                            events.push(CaptureEvent::SelectionChanged(next_rect));
+                        }
                         sel.interaction = SelectionInteraction::Hovering;
                     }
                 } else {
-                    sel.set_idle();
+                    if sel.interaction != SelectionInteraction::Dragging {
+                        sel.set_idle();
+                    }
                 }
-                (
-                    CaptureSessionState::Selecting(sel),
-                    vec![CaptureEvent::SnapCandidateChanged(cand)],
-                )
+                (CaptureSessionState::Selecting(sel), events)
             }
             (CaptureSessionState::Selecting(mut sel), CaptureCommand::BeginFreeSelection(p)) => {
                 if sel.clamp_bounds.is_none() {
@@ -361,7 +426,9 @@ impl CaptureSession {
                         sel.set_clamp_bounds(Some(f.bounds()));
                     }
                 }
-                sel.begin_free_selection(p);
+                sel.begin_free_selection(
+                    sel.clamp_bounds.map_or(p, |bounds| bounds.clamp_point(p)),
+                );
                 let rect = sel.rect;
                 (
                     CaptureSessionState::Selecting(sel),
@@ -385,7 +452,10 @@ impl CaptureSession {
                     vec![CaptureEvent::SelectionChanged(rect)],
                 )
             }
-            (CaptureSessionState::Selecting(mut sel), CaptureCommand::ResizeSelection(handle, p)) => {
+            (
+                CaptureSessionState::Selecting(mut sel),
+                CaptureCommand::ResizeSelection(handle, p),
+            ) => {
                 sel.begin_resize(handle);
                 sel.resize_to(handle, p);
                 let rect = sel.rect;
@@ -399,14 +469,22 @@ impl CaptureSession {
                 if selection.is_empty() || self.current_frame.is_none() {
                     return (
                         CaptureSessionState::Selecting(sel),
-                        vec![CaptureEvent::Error("cannot commit an empty selection".to_string())],
+                        vec![CaptureEvent::Error(CaptureError::InvalidSelection(
+                            "cannot commit an empty selection".to_string(),
+                        ))],
                     );
                 }
-                let bounds = self.current_frame.as_ref().map(|f| f.bounds()).unwrap_or(selection);
-                let document = CaptureDocument::new(
-                    self.current_frame.clone().unwrap(),
-                    selection.clamp(bounds),
-                );
+                let Some(frame) = self.current_frame.clone() else {
+                    return (
+                        CaptureSessionState::Selecting(sel),
+                        vec![CaptureEvent::Error(CaptureError::InvalidSelection(
+                            "cannot commit without a captured frame".to_string(),
+                        ))],
+                    );
+                };
+                let frame_bounds = frame.bounds();
+                let document = CaptureDocument::new(frame, selection.clamp(frame_bounds));
+                self.hover_candidate = None;
                 (
                     CaptureSessionState::Editing(EditorSession::new(document)),
                     vec![CaptureEvent::StateChanged, CaptureEvent::DocumentChanged],
@@ -416,8 +494,49 @@ impl CaptureSession {
                 editor.set_tool(tool);
                 (
                     CaptureSessionState::Editing(editor),
-                    vec![CaptureEvent::DocumentChanged],
+                    vec![CaptureEvent::ToolChanged(tool)],
                 )
+            }
+            (CaptureSessionState::Editing(mut editor), CaptureCommand::MoveSelection(delta)) => {
+                let crop = editor
+                    .document
+                    .crop
+                    .translate(delta)
+                    .clamp(editor.document.source.bounds());
+                if editor.update_crop(crop) {
+                    (
+                        CaptureSessionState::Editing(editor),
+                        vec![
+                            CaptureEvent::SelectionChanged(crop),
+                            CaptureEvent::DocumentChanged,
+                        ],
+                    )
+                } else {
+                    (CaptureSessionState::Editing(editor), vec![])
+                }
+            }
+            (
+                CaptureSessionState::Editing(mut editor),
+                CaptureCommand::ResizeSelection(handle, p),
+            ) => {
+                let crop = resize_rect(
+                    editor.document.crop,
+                    handle,
+                    p,
+                    1,
+                    Some(editor.document.source.bounds()),
+                );
+                if editor.update_crop(crop) {
+                    (
+                        CaptureSessionState::Editing(editor),
+                        vec![
+                            CaptureEvent::SelectionChanged(crop),
+                            CaptureEvent::DocumentChanged,
+                        ],
+                    )
+                } else {
+                    (CaptureSessionState::Editing(editor), vec![])
+                }
             }
             (CaptureSessionState::Editing(mut editor), CaptureCommand::BeginAnnotation(p)) => {
                 editor.begin_annotation(p);
@@ -429,29 +548,46 @@ impl CaptureSession {
                 (CaptureSessionState::Editing(editor), events)
             }
             (CaptureSessionState::Editing(mut editor), CaptureCommand::UpdateAnnotation(p)) => {
+                let before = editor.active_preview();
                 editor.update_annotation(p);
-                (
-                    CaptureSessionState::Editing(editor),
-                    vec![CaptureEvent::DocumentChanged],
-                )
+                let events = if before != editor.active_preview() {
+                    vec![CaptureEvent::DocumentChanged]
+                } else {
+                    vec![]
+                };
+                (CaptureSessionState::Editing(editor), events)
             }
             (CaptureSessionState::Editing(mut editor), CaptureCommand::EndAnnotation) => {
-                let _ = editor.end_annotation();
-                (
-                    CaptureSessionState::Editing(editor),
-                    vec![CaptureEvent::DocumentChanged],
-                )
+                let changed = editor.end_annotation();
+                let events = if changed {
+                    vec![CaptureEvent::DocumentChanged]
+                } else {
+                    vec![]
+                };
+                (CaptureSessionState::Editing(editor), events)
             }
             (CaptureSessionState::Editing(mut editor), CaptureCommand::Undo) => {
-                let _ = editor.undo();
-                (
-                    CaptureSessionState::Editing(editor),
-                    vec![CaptureEvent::DocumentChanged],
-                )
+                let changed = editor.undo();
+                let events = if changed {
+                    vec![CaptureEvent::DocumentChanged]
+                } else {
+                    vec![]
+                };
+                (CaptureSessionState::Editing(editor), events)
             }
-            (CaptureSessionState::Editing(editor), CaptureCommand::InvokeAction(id)) => {
-                (CaptureSessionState::Editing(editor), vec![CaptureEvent::ActionRequested(id)])
+            (CaptureSessionState::Editing(mut editor), CaptureCommand::Redo) => {
+                let changed = editor.redo();
+                let events = if changed {
+                    vec![CaptureEvent::DocumentChanged]
+                } else {
+                    vec![]
+                };
+                (CaptureSessionState::Editing(editor), events)
             }
+            (CaptureSessionState::Editing(editor), CaptureCommand::InvokeAction(id)) => (
+                CaptureSessionState::Editing(editor),
+                vec![CaptureEvent::ActionRequested(id)],
+            ),
             (
                 CaptureSessionState::Selecting(_) | CaptureSessionState::Editing(_),
                 CaptureCommand::Cancel,
@@ -471,10 +607,10 @@ impl CaptureSession {
             // Out-of-order / invalid commands are reported as an error event.
             (rest, other) => (
                 rest,
-                vec![CaptureEvent::Error(format!(
+                vec![CaptureEvent::Error(CaptureError::InvalidCommand(format!(
                     "invalid command {:?}",
                     other
-                ))],
+                )))],
             ),
         }
     }
@@ -515,11 +651,10 @@ mod tests {
                 CaptureCommand::CommitSelection,
             ],
         );
-        assert!(matches!(
-            s.state(),
-            CaptureSessionState::Editing(_)
-        ));
-        assert!(events.iter().any(|e| matches!(e, CaptureEvent::StateChanged)));
+        assert!(matches!(s.state(), CaptureSessionState::Editing(_)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CaptureEvent::StateChanged)));
         assert!(events
             .iter()
             .any(|e| matches!(e, CaptureEvent::SelectionChanged(_))));
@@ -543,7 +678,10 @@ mod tests {
         );
         match s.state() {
             CaptureSessionState::Editing(ed) => {
-                assert_eq!(ed.document.crop, PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(200, 100)));
+                assert_eq!(
+                    ed.document.crop,
+                    PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(200, 100))
+                );
             }
             other => panic!("expected Editing, got {:?}", other),
         }
@@ -554,13 +692,17 @@ mod tests {
         let mut s = CaptureSession::new();
         drive(
             &mut s,
-            vec![CaptureCommand::Begin, CaptureCommand::FrameReady(frame(400, 400))],
+            vec![
+                CaptureCommand::Begin,
+                CaptureCommand::FrameReady(frame(400, 400)),
+            ],
         );
         let candidate = SnapCandidate {
             id: capture_core::SnapCandidateId::new(7),
             bounds: PhysicalRect::new(PhysicalPoint::new(20, 30), PhysicalSize::new(100, 60)),
             kind: capture_core::SnapKind::Window,
             label: Some("win".to_string()),
+            z_order: 0,
         };
         s.apply(CaptureCommand::SnapCandidate(Some(candidate.clone())));
         match s.state() {
@@ -575,6 +717,38 @@ mod tests {
                 assert_eq!(ed.document.crop, candidate.bounds);
             }
             other => panic!("expected Editing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn snap_candidate_switch_updates_hovered_selection() {
+        let mut s = CaptureSession::new();
+        drive(
+            &mut s,
+            vec![
+                CaptureCommand::Begin,
+                CaptureCommand::FrameReady(frame(400, 400)),
+            ],
+        );
+        let first = SnapCandidate {
+            id: capture_core::SnapCandidateId::new(1),
+            bounds: PhysicalRect::new(PhysicalPoint::new(10, 20), PhysicalSize::new(80, 60)),
+            kind: capture_core::SnapKind::Window,
+            label: Some("first".to_string()),
+            z_order: 0,
+        };
+        let second = SnapCandidate {
+            id: capture_core::SnapCandidateId::new(2),
+            bounds: PhysicalRect::new(PhysicalPoint::new(200, 220), PhysicalSize::new(100, 70)),
+            kind: capture_core::SnapKind::Window,
+            label: Some("second".to_string()),
+            z_order: 1,
+        };
+        s.apply(CaptureCommand::SnapCandidate(Some(first)));
+        s.apply(CaptureCommand::SnapCandidate(Some(second.clone())));
+        match s.state() {
+            CaptureSessionState::Selecting(selection) => assert_eq!(selection.rect, second.bounds),
+            other => panic!("expected Selecting, got {:?}", other),
         }
     }
 
@@ -611,6 +785,86 @@ mod tests {
             _ => panic!("expected Editing"),
         };
         assert_eq!(after_undo, 0);
+
+        s.apply(CaptureCommand::Redo);
+        match s.state() {
+            CaptureSessionState::Editing(ed) => assert_eq!(ed.document.annotations.len(), 1),
+            _ => panic!("expected Editing"),
+        }
+    }
+
+    #[test]
+    fn editing_selection_can_move_and_resize() {
+        let mut s = CaptureSession::new();
+        drive(
+            &mut s,
+            vec![
+                CaptureCommand::Begin,
+                CaptureCommand::FrameReady(frame(200, 200)),
+                CaptureCommand::BeginFreeSelection(PhysicalPoint::new(20, 20)),
+                CaptureCommand::UpdateFreeSelection(PhysicalPoint::new(80, 80)),
+                CaptureCommand::CommitSelection,
+                CaptureCommand::MoveSelection(PhysicalPoint::new(10, 15)),
+            ],
+        );
+        match s.state() {
+            CaptureSessionState::Editing(ed) => {
+                assert_eq!(
+                    ed.document.crop,
+                    PhysicalRect::new(PhysicalPoint::new(30, 35), PhysicalSize::new(60, 60))
+                );
+            }
+            other => panic!("expected Editing, got {:?}", other),
+        }
+        s.apply(CaptureCommand::ResizeSelection(
+            ResizeHandle::BottomRight,
+            PhysicalPoint::new(120, 130),
+        ));
+        match s.state() {
+            CaptureSessionState::Editing(ed) => {
+                assert_eq!(ed.document.crop.right(), 120);
+                assert_eq!(ed.document.crop.bottom(), 130);
+            }
+            other => panic!("expected Editing, got {:?}", other),
+        }
+        s.apply(CaptureCommand::Undo);
+        match s.state() {
+            CaptureSessionState::Editing(ed) => assert_eq!(ed.document.crop.right(), 90),
+            other => panic!("expected Editing, got {:?}", other),
+        }
+        s.apply(CaptureCommand::Redo);
+        match s.state() {
+            CaptureSessionState::Editing(ed) => assert_eq!(ed.document.crop.right(), 120),
+            other => panic!("expected Editing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn annotations_are_clamped_to_crop() {
+        let mut s = CaptureSession::new();
+        drive(
+            &mut s,
+            vec![
+                CaptureCommand::Begin,
+                CaptureCommand::FrameReady(frame(100, 100)),
+                CaptureCommand::BeginFreeSelection(PhysicalPoint::new(20, 20)),
+                CaptureCommand::UpdateFreeSelection(PhysicalPoint::new(60, 60)),
+                CaptureCommand::CommitSelection,
+                CaptureCommand::BeginAnnotation(PhysicalPoint::new(0, 0)),
+                CaptureCommand::UpdateAnnotation(PhysicalPoint::new(100, 100)),
+                CaptureCommand::EndAnnotation,
+            ],
+        );
+        match s.state() {
+            CaptureSessionState::Editing(ed) => match &ed.document.annotations[0] {
+                Annotation::Pen(stroke) => {
+                    assert_eq!(stroke.points[0], PhysicalPoint::new(20, 20));
+                    assert_eq!(stroke.points[1], PhysicalPoint::new(59, 59));
+                }
+                other => panic!("expected pen annotation, got {:?}", other),
+            },
+            other => panic!("expected Editing, got {:?}", other),
+        }
     }
 
     #[test]

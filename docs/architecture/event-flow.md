@@ -15,8 +15,8 @@ The frontend (or the CLI) is responsible for:
 - translating OS pointer events into `PhysicalPoint`s (already in physical
   pixels);
 - interpreting snap candidates from `SnapBackend::candidates_at` and telling the
-  Core which candidate is hovered (`CaptureCommand::PointerMoved`) so it can
-  highlight;
+  Core which candidate is hovered (`CaptureCommand::SnapCandidate`) so it can
+  highlight and update the preview rectangle;
 - drawing all visual feedback (selection rect, handles, annotation preview,
   toolbar) from the state the Core exposes.
 
@@ -35,7 +35,7 @@ document/annotation mutation, undo, action invocation, and reporting
   ▼             ┌──────────────────────────────┐
  Selecting ─────┤ CommitSelection               │
   │             ▼                              │
-  │           Editing ──(Undo/SelectTool/InvokeAction)──► Editing
+  │           Editing ──(Move/Resize/Undo/Redo/InvokeAction)──► Editing
   │             │                              │
   └── Cancel ◄──┴── Cancel                     │
       │                              Completed │
@@ -55,7 +55,8 @@ document/annotation mutation, undo, action invocation, and reporting
 | `MoveSelection(delta)` | Editing | move crop within source |
 | `ResizeSelection(handle, target)` | Editing | resize crop via handle |
 | `SelectTool(tool)` | Editing | set active tool |
-| `Undo` | Editing | pop last annotation |
+| `Undo` | Editing | restore the previous crop + annotation snapshot |
+| `Redo` | Editing | restore the next crop + annotation snapshot |
 | `InvokeAction(action_id)` | Editing | emit `ActionRequested` |
 | `Cancel` | Selecting/Editing | → `Idle`, discard doc |
 
@@ -65,6 +66,7 @@ document/annotation mutation, undo, action invocation, and reporting
 - `SnapCandidateChanged(Option<SnapCandidate>)`
 - `SelectionChanged(PhysicalRect)`
 - `DocumentChanged`
+- `ToolChanged(AnnotationTool)`
 - `ActionRequested(ActionId)`
 - `Completed`
 - `Error(CaptureError)`
@@ -74,12 +76,15 @@ drawing primitives.
 
 ## 5. Measurement timestamps
 
-The Core records only `T0` (hotkey) and `T1` (frame ready) via a
-`TimingPoint`/`Beat` sink (`capture-core::capture::Timing`). The frontend records
-`T2`/`T3`/`T4` and combines them. See `CORE_BASELINE_REPORT.md` § Benchmark.
+The Core records only `T0` (hotkey) and `T1` (frame ready) via
+`capture_core::capture::Timing`. The frontend records `T2`/`T3`/`T4` and
+combines them. `T0` must be sent before the backend capture call, as the CLI
+acceptance flow does. See `CORE_BASELINE_REPORT.md` for the measurement notes.
 
 ## 6. Self-exclusion
 
-Before it starts snapping, the frontend passes its overlay/Pin window handle to
-`SnapBackend::set_excluded_window(Some(token))`, so the overlay never highlights
-itself. The token is an opaque `u64`; its meaning is backend-defined.
+Before it starts snapping, the frontend passes all overlay/Pin window handles to
+`SnapBackend::set_excluded_windows(tokens)`, so none of its own windows can be
+highlighted. `set_excluded_window(Some(token))` remains as a compatibility
+shortcut for one window. Tokens are opaque `u64` values whose meaning is
+backend-defined.

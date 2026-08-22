@@ -5,6 +5,10 @@
 
 use crate::geometry::{PhysicalPoint, PhysicalRect};
 
+fn saturating_i64_to_i32(value: i64) -> i32 {
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 /// The eight resize handles of a selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResizeHandle {
@@ -105,10 +109,8 @@ impl SelectionSession {
 
     pub fn update_free_selection(&mut self, point: PhysicalPoint) {
         if let Some(origin) = self.drag_origin {
-            self.rect = clamp_rect_to_bounds(
-                PhysicalRect::from_points(origin, point),
-                self.clamp_bounds,
-            );
+            self.rect =
+                clamp_rect_to_bounds(PhysicalRect::from_points(origin, point), self.clamp_bounds);
         }
     }
 
@@ -151,10 +153,12 @@ impl SelectionSession {
     /// Does `p` hit a resize handle (within a small tolerance)? Returns the hit
     /// handle if any.
     pub fn hit_resize_handle(&self, p: PhysicalPoint, tolerance: u32) -> Option<ResizeHandle> {
-        let t = tolerance as i32;
+        let t = tolerance as i64;
         for &handle in &ResizeHandle::ALL {
             let corner = handle_corner(self.rect, handle);
-            if (corner.x - p.x).abs() <= t && (corner.y - p.y).abs() <= t {
+            if (corner.x as i64 - p.x as i64).abs() <= t
+                && (corner.y as i64 - p.y as i64).abs() <= t
+            {
                 return Some(handle);
             }
         }
@@ -169,13 +173,24 @@ fn handle_corner(rect: PhysicalRect, handle: ResizeHandle) -> PhysicalPoint {
     let bottom = rect.bottom();
     match handle {
         ResizeHandle::TopLeft => PhysicalPoint::new(left, top),
-        ResizeHandle::Top => PhysicalPoint::new((left + right) / 2, top),
+        ResizeHandle::Top => {
+            PhysicalPoint::new(saturating_i64_to_i32((left as i64 + right as i64) / 2), top)
+        }
         ResizeHandle::TopRight => PhysicalPoint::new(right, top),
-        ResizeHandle::Right => PhysicalPoint::new(right, (top + bottom) / 2),
+        ResizeHandle::Right => PhysicalPoint::new(
+            right,
+            saturating_i64_to_i32((top as i64 + bottom as i64) / 2),
+        ),
         ResizeHandle::BottomRight => PhysicalPoint::new(right, bottom),
-        ResizeHandle::Bottom => PhysicalPoint::new((left + right) / 2, bottom),
+        ResizeHandle::Bottom => PhysicalPoint::new(
+            saturating_i64_to_i32((left as i64 + right as i64) / 2),
+            bottom,
+        ),
         ResizeHandle::BottomLeft => PhysicalPoint::new(left, bottom),
-        ResizeHandle::Left => PhysicalPoint::new(left, (top + bottom) / 2),
+        ResizeHandle::Left => PhysicalPoint::new(
+            left,
+            saturating_i64_to_i32((top as i64 + bottom as i64) / 2),
+        ),
     }
 }
 
@@ -188,39 +203,39 @@ pub fn resize_rect(
     min_size: u32,
     clamp_bounds: Option<PhysicalRect>,
 ) -> PhysicalRect {
-    let min = min_size.max(1) as i32;
-    let left = rect.origin.x;
-    let top = rect.origin.y;
-    let right = rect.right();
-    let bottom = rect.bottom();
+    let min = min_size.max(1) as i64;
+    let left = rect.origin.x as i64;
+    let top = rect.origin.y as i64;
+    let right = rect.right() as i64;
+    let bottom = rect.bottom() as i64;
 
     let (mut nl, mut nt, mut nr, mut nb) = (left, top, right, bottom);
     match handle {
-        ResizeHandle::Left => nl = target.x.min(nr - min),
-        ResizeHandle::Right => nr = target.x.max(nl + min),
-        ResizeHandle::Top => nt = target.y.min(nb - min),
-        ResizeHandle::Bottom => nb = target.y.max(nt + min),
+        ResizeHandle::Left => nl = (target.x as i64).min(nr - min),
+        ResizeHandle::Right => nr = (target.x as i64).max(nl + min),
+        ResizeHandle::Top => nt = (target.y as i64).min(nb - min),
+        ResizeHandle::Bottom => nb = (target.y as i64).max(nt + min),
         ResizeHandle::TopLeft => {
-            nl = target.x.min(nr - min);
-            nt = target.y.min(nb - min);
+            nl = (target.x as i64).min(nr - min);
+            nt = (target.y as i64).min(nb - min);
         }
         ResizeHandle::TopRight => {
-            nr = target.x.max(nl + min);
-            nt = target.y.min(nb - min);
+            nr = (target.x as i64).max(nl + min);
+            nt = (target.y as i64).min(nb - min);
         }
         ResizeHandle::BottomLeft => {
-            nl = target.x.min(nr - min);
-            nb = target.y.max(nt + min);
+            nl = (target.x as i64).min(nr - min);
+            nb = (target.y as i64).max(nt + min);
         }
         ResizeHandle::BottomRight => {
-            nr = target.x.max(nl + min);
-            nb = target.y.max(nt + min);
+            nr = (target.x as i64).max(nl + min);
+            nb = (target.y as i64).max(nt + min);
         }
     }
 
     let resized = PhysicalRect::from_points(
-        PhysicalPoint::new(nl, nt),
-        PhysicalPoint::new(nr, nb),
+        PhysicalPoint::new(saturating_i64_to_i32(nl), saturating_i64_to_i32(nt)),
+        PhysicalPoint::new(saturating_i64_to_i32(nr), saturating_i64_to_i32(nb)),
     );
     clamp_rect_to_bounds(resized, clamp_bounds)
 }
@@ -291,7 +306,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.hit_resize_handle(p(2, 0), 5), Some(ResizeHandle::TopLeft));
-        assert_eq!(s.hit_resize_handle(p(100, 100), 5), Some(ResizeHandle::BottomRight));
+        assert_eq!(
+            s.hit_resize_handle(p(100, 100), 5),
+            Some(ResizeHandle::BottomRight)
+        );
         assert_eq!(s.hit_resize_handle(p(50, 50), 5), None);
     }
 }

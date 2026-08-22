@@ -6,6 +6,10 @@ use capture_annotation::{Annotation, CaptureDocument, Color};
 use capture_core::geometry::PhysicalPoint;
 use std::io::Write;
 
+fn saturating_i64_to_i32(value: i64) -> i32 {
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 /// A flat RGBA8 bitmap.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedImage {
@@ -39,19 +43,30 @@ pub enum RenderError {
 /// Flatten a document into a final RGBA8 bitmap (crop + annotations composited).
 pub fn flatten(document: &CaptureDocument) -> Result<RenderedImage, RenderError> {
     if let Err(e) = document.validate() {
-        return Err(RenderError::InvalidDocument(e));
+        return Err(RenderError::InvalidDocument(e.to_string()));
     }
-    let source = &document.source;
+    let source = document
+        .source
+        .as_ref()
+        .clone()
+        .to_rgba8()
+        .map_err(|error| RenderError::InvalidDocument(error.to_string()))?;
     let crop = document.crop;
     let cw = crop.size.width as usize;
     let ch = crop.size.height as usize;
-    let bpp = capture_core::PixelFormat::Rgba8.bytes_per_pixel() as usize;
+    let bpp = 4usize;
+    let pixel_count = cw
+        .checked_mul(ch)
+        .and_then(|count| count.checked_mul(bpp))
+        .ok_or_else(|| {
+            RenderError::InvalidDocument("render buffer size overflows usize".to_string())
+        })?;
     let stride = source.stride as usize;
     let src_origin = source.origin;
     let src_w = source.width as i64;
     let src_h = source.height as i64;
 
-    let mut pixels = vec![0u8; cw * ch * bpp];
+    let mut pixels = vec![0u8; pixel_count];
 
     // 1. Copy the crop region from the frame into the output (top-left origin).
     for y in 0..ch {
@@ -66,20 +81,29 @@ pub fn flatten(document: &CaptureDocument) -> Result<RenderedImage, RenderError>
             if local_x < 0 || local_x >= src_w {
                 continue;
             }
-            let src_idx = (local_y as usize) * stride + (local_x as usize) * bpp;
+            let Some(src_idx) = (local_y as usize)
+                .checked_mul(stride)
+                .and_then(|row| row.checked_add((local_x as usize).saturating_mul(bpp)))
+            else {
+                return Err(RenderError::InvalidDocument(
+                    "source index overflows usize".to_string(),
+                ));
+            };
             let dst_idx = (y * cw + x) * bpp;
-            let src = source.pixels.get(src_idx..src_idx + bpp).unwrap_or(&[0; 4]);
-            pixels[dst_idx..dst_idx + bpp].copy_from_slice(&src[..4]);
+            let src = source.pixels.get(src_idx..src_idx + bpp).ok_or_else(|| {
+                RenderError::InvalidDocument("source row is shorter than stride".to_string())
+            })?;
+            pixels[dst_idx..dst_idx + bpp].copy_from_slice(src);
         }
     }
 
     // 2. Composite annotations in frame-absolute coordinates, offset by the crop.
     let mut canvas = Canvas {
         pixels: &mut pixels,
-        width: cw as u32,
-        height: ch as u32,
-        offset_x: -crop.origin.x,
-        offset_y: -crop.origin.y,
+        width: crop.size.width,
+        height: crop.size.height,
+        offset_x: saturating_i64_to_i32(-(crop.origin.x as i64)),
+        offset_y: saturating_i64_to_i32(-(crop.origin.y as i64)),
     };
     for ann in &document.annotations {
         canvas.draw_annotation(ann);
@@ -90,6 +114,17 @@ pub fn flatten(document: &CaptureDocument) -> Result<RenderedImage, RenderError>
 
 /// Encode a rendered image as PNG bytes.
 pub fn encode_png(image: &RenderedImage) -> Result<Vec<u8>, RenderError> {
+    let expected = (image.width as usize)
+        .checked_mul(image.height as usize)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| RenderError::PngEncode("image dimensions overflow usize".to_string()))?;
+    if image.pixels.len() != expected {
+        return Err(RenderError::PngEncode(format!(
+            "RGBA image length {} does not match expected {}",
+            image.pixels.len(),
+            expected
+        )));
+    }
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, image.width, image.height);
@@ -106,11 +141,87 @@ pub fn encode_png(image: &RenderedImage) -> Result<Vec<u8>, RenderError> {
 }
 
 /// Encode and write PNG to a path.
-pub fn save_png(path: impl AsRef<std::path::Path>, image: &RenderedImage) -> Result<(), RenderError> {
+pub fn save_png(
+    path: impl AsRef<std::path::Path>,
+    image: &RenderedImage,
+) -> Result<(), RenderError> {
     let bytes = encode_png(image)?;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&bytes)?;
+    let path = path.as_ref();
+    if path.is_dir() {
+        return Err(RenderError::Io(std::io::Error::other(format!(
+            "output path is a directory: {}",
+            path.display()
+        ))));
+    }
+
+    // Write beside the destination first. A failed encode/write must not
+    // truncate a previously valid capture. The final rename is atomic on
+    // Unix; Windows uses a backup/restore sequence because std::fs::rename
+    // does not replace an existing file there.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("capture.png"));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_path = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(RenderError::Io(error));
+    }
+
+    if let Err(error) = install_file(&temp_path, path, nonce) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(RenderError::Io(error));
+    }
     Ok(())
+}
+
+fn install_file(
+    temp_path: &std::path::Path,
+    destination: &std::path::Path,
+    nonce: u128,
+) -> std::io::Result<()> {
+    if !destination.exists() {
+        return std::fs::rename(temp_path, destination);
+    }
+
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("capture.png"));
+    let backup_path = parent.join(format!(".{file_name}.{}.{}.bak", std::process::id(), nonce));
+    std::fs::rename(destination, &backup_path)?;
+    match std::fs::rename(temp_path, destination) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(backup_path);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::rename(&backup_path, destination);
+            Err(error)
+        }
+    }
 }
 
 /// A simple, fast, deterministic checksum used by golden tests (FNV-1a).
@@ -175,27 +286,42 @@ impl<'a> Canvas<'a> {
             self.blend(cx, cy, color);
             return;
         }
+        let radius = i64::from(radius).min(4096);
         let r2 = radius * radius;
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 if dx * dx + dy * dy <= r2 {
-                    self.blend(cx + dx, cy + dy, color);
+                    let x = i64::from(cx) + dx;
+                    let y = i64::from(cy) + dy;
+                    if x >= i32::MIN as i64
+                        && x <= i32::MAX as i64
+                        && y >= i32::MIN as i64
+                        && y <= i32::MAX as i64
+                    {
+                        self.blend(x as i32, y as i32, color);
+                    }
                 }
             }
         }
     }
 
     fn thick_line(&mut self, p0: PhysicalPoint, p1: PhysicalPoint, thickness: u32, color: Color) {
-        let radius = (thickness as i32) / 2;
-        let (mut x0, mut y0) = (p0.x, p0.y);
-        let (x1, y1) = (p1.x, p1.y);
+        let radius = thickness.min(i32::MAX as u32) as i32 / 2;
+        let (mut x0, mut y0) = (p0.x as i64, p0.y as i64);
+        let (x1, y1) = (p1.x as i64, p1.y as i64);
         let dx = (x1 - x0).abs();
         let dy = (y1 - y0).abs();
         let sx = if x0 < x1 { 1 } else { -1 };
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx - dy;
         loop {
-            self.stamp_disc(x0, y0, radius, color);
+            if x0 >= i32::MIN as i64
+                && x0 <= i32::MAX as i64
+                && y0 >= i32::MIN as i64
+                && y0 <= i32::MAX as i64
+            {
+                self.stamp_disc(x0 as i32, y0 as i32, radius, color);
+            }
             if x0 == x1 && y0 == y1 {
                 break;
             }
@@ -218,11 +344,19 @@ impl<'a> Canvas<'a> {
                     .points
                     .iter()
                     .map(|p| {
-                        PhysicalPoint::new(p.x + self.offset_x, p.y + self.offset_y)
+                        PhysicalPoint::new(
+                            saturating_i64_to_i32(p.x as i64 + self.offset_x as i64),
+                            saturating_i64_to_i32(p.y as i64 + self.offset_y as i64),
+                        )
                     })
                     .collect();
                 if pts.len() == 1 {
-                    self.stamp_disc(pts[0].x, pts[0].y, (stroke.thickness as i32) / 2, stroke.color);
+                    self.stamp_disc(
+                        pts[0].x,
+                        pts[0].y,
+                        (stroke.thickness as i32) / 2,
+                        stroke.color,
+                    );
                     return;
                 }
                 for w in pts.windows(2) {
@@ -235,8 +369,12 @@ impl<'a> Canvas<'a> {
                     .translate(PhysicalPoint::new(self.offset_x, self.offset_y));
                 // Fill (if any) then outline.
                 if let Some(fill) = shape.fill {
-                    for y in rect.top()..rect.bottom() {
-                        for x in rect.left()..rect.right() {
+                    let left = rect.left().max(0).min(self.width as i32);
+                    let top = rect.top().max(0).min(self.height as i32);
+                    let right = rect.right().max(left).min(self.width as i32);
+                    let bottom = rect.bottom().max(top).min(self.height as i32);
+                    for y in top..bottom {
+                        for x in left..right {
                             self.blend(x, y, fill);
                         }
                     }
@@ -279,7 +417,10 @@ mod tests {
     #[test]
     fn flatten_crop_only_matches_source() {
         // 20x10 frame filled with value 0x11; crop the 10x5 top-left region.
-        let mut doc = CaptureDocument::new(Arc::new(frame(20, 10, 0x11)), PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(10, 5)));
+        let mut doc = CaptureDocument::new(
+            Arc::new(frame(20, 10, 0x11)),
+            PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(10, 5)),
+        );
         let img = flatten(&doc).unwrap();
         assert_eq!(img.width, 10);
         assert_eq!(img.height, 5);
@@ -307,14 +448,14 @@ mod tests {
 
     #[test]
     fn render_pen_stroke_produces_deterministic_output() {
-        let mut doc = CaptureDocument::new(Arc::new(frame(64, 64, 0x00)), PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(64, 64)));
+        let mut doc = CaptureDocument::new(
+            Arc::new(frame(64, 64, 0x00)),
+            PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(64, 64)),
+        );
         doc.annotations.push(Annotation::Pen(PenStroke {
             color: Color::WHITE,
             thickness: 5,
-            points: vec![
-                PhysicalPoint::new(10, 10),
-                PhysicalPoint::new(30, 10),
-            ],
+            points: vec![PhysicalPoint::new(10, 10), PhysicalPoint::new(30, 10)],
         }));
         let a = flatten(&doc).unwrap();
         let b = flatten(&doc).unwrap();
@@ -325,7 +466,10 @@ mod tests {
     /// Golden test: a fixed document must always flatten to a fixed checksum.
     #[test]
     fn golden_checksum_is_stable() {
-        let mut doc = CaptureDocument::new(Arc::new(frame(96, 64, 0x3C)), PhysicalRect::new(PhysicalPoint::new(8, 8), PhysicalSize::new(80, 48)));
+        let mut doc = CaptureDocument::new(
+            Arc::new(frame(96, 64, 0x3C)),
+            PhysicalRect::new(PhysicalPoint::new(8, 8), PhysicalSize::new(80, 48)),
+        );
         doc.annotations.push(Annotation::Rectangle(RectShape::new(
             PhysicalRect::new(PhysicalPoint::new(12, 12), PhysicalSize::new(40, 24)),
             Color::BLUE,
@@ -349,9 +493,50 @@ mod tests {
 
     #[test]
     fn png_round_trip_includes_header() {
-        let doc = CaptureDocument::new(Arc::new(frame(16, 16, 0x12)), PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(16, 16)));
+        let doc = CaptureDocument::new(
+            Arc::new(frame(16, 16, 0x12)),
+            PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(16, 16)),
+        );
         let img = flatten(&doc).unwrap();
         let png = encode_png(&img).unwrap();
         assert!(png.starts_with(&[0x89, 0x50, 0x4E, 0x47]));
+    }
+
+    #[test]
+    fn failed_save_does_not_truncate_existing_destination() {
+        let path = std::env::temp_dir().join(format!(
+            "capture-render-failed-save-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"previous capture").unwrap();
+        let invalid = RenderedImage::new(1, 1, vec![]);
+        assert!(save_png(&path, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous capture");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_replaces_existing_destination() {
+        let path = std::env::temp_dir().join(format!(
+            "capture-render-replace-save-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"previous capture").unwrap();
+        let image = flatten(&CaptureDocument::new(
+            Arc::new(frame(2, 2, 0x44)),
+            PhysicalRect::new(PhysicalPoint::new(0, 0), PhysicalSize::new(2, 2)),
+        ))
+        .unwrap();
+        save_png(&path, &image).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_rejects_directory_destination() {
+        let dir = std::env::temp_dir();
+        let image = RenderedImage::new(1, 1, vec![0, 0, 0, 255]);
+        assert!(save_png(&dir, &image).is_err());
     }
 }

@@ -1,7 +1,7 @@
 //! Annotation document model, shared by Core, renderer, and actions.
 
 use capture_core::geometry::{PhysicalPoint, PhysicalRect};
-use capture_core::CapturedFrame;
+use capture_core::{CaptureError, CapturedFrame};
 use std::sync::Arc;
 
 /// An RGBA color (8 bits per channel).
@@ -140,9 +140,10 @@ impl CaptureDocument {
     }
 
     /// True when the crop fully lies within the source frame.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), CaptureError> {
+        self.source.validate()?;
         if self.crop.is_empty() {
-            return Err("crop is empty".to_string());
+            return Err(CaptureError::InvalidSelection("crop is empty".to_string()));
         }
         let bounds = self.source.bounds();
         if self.crop.origin.x < bounds.origin.x
@@ -150,7 +151,9 @@ impl CaptureDocument {
             || self.crop.right() > bounds.right()
             || self.crop.bottom() > bounds.bottom()
         {
-            return Err("crop extends outside the captured frame".to_string());
+            return Err(CaptureError::InvalidSelection(
+                "crop extends outside the captured frame".to_string(),
+            ));
         }
         Ok(())
     }

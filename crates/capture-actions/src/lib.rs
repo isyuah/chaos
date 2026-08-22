@@ -82,9 +82,13 @@ pub struct SaveAction {
 
 impl SaveAction {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-        }
+        Self { path: path.into() }
+    }
+}
+
+impl Default for SaveAction {
+    fn default() -> Self {
+        Self::new("capture.png")
     }
 }
 
@@ -143,6 +147,7 @@ fn payload_from(document: &CaptureDocument) -> Result<ActionPayload, ActionError
 pub fn all_actions() -> Vec<Box<dyn CaptureAction>> {
     vec![
         Box::new(CopyAction),
+        Box::new(SaveAction::default()),
         Box::new(PinAction),
         Box::new(AskAiAction),
     ]
@@ -152,6 +157,7 @@ pub fn all_actions() -> Vec<Box<dyn CaptureAction>> {
 pub fn action_by_id(id: ActionId) -> Option<Box<dyn CaptureAction>> {
     match id.as_str() {
         "copy" => Some(Box::new(CopyAction)),
+        "save" => Some(Box::new(SaveAction::default())),
         "pin" => Some(Box::new(PinAction)),
         "ask-ai" => Some(Box::new(AskAiAction)),
         _ => None,
@@ -162,8 +168,8 @@ pub fn action_by_id(id: ActionId) -> Option<Box<dyn CaptureAction>> {
 mod tests {
     use super::*;
     use capture_annotation::document::{Annotation, Color, PenStroke};
-    use capture_core::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
     use capture_core::capture::{CapturedFrame, PixelFormat};
+    use capture_core::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
     use std::sync::Arc;
 
     fn doc() -> CaptureDocument {
@@ -184,10 +190,7 @@ mod tests {
         doc.push_annotation(Annotation::Pen(PenStroke {
             color: Color::RED,
             thickness: 2,
-            points: vec![
-                PhysicalPoint::new(3, 3),
-                PhysicalPoint::new(12, 10),
-            ],
+            points: vec![PhysicalPoint::new(3, 3), PhysicalPoint::new(12, 10)],
         }));
         doc
     }
@@ -221,5 +224,11 @@ mod tests {
         assert_eq!(SaveAction::new("x").id(), "save");
         assert_eq!(PinAction.id(), "pin");
         assert_eq!(AskAiAction.id(), "ask-ai");
+    }
+
+    #[test]
+    fn registry_contains_save() {
+        assert!(action_by_id(ActionId::SAVE).is_some());
+        assert!(all_actions().iter().any(|action| action.id() == "save"));
     }
 }
