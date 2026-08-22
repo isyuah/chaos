@@ -1,0 +1,14 @@
+[package]
+name = "capture-actions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Capture actions (Copy / Save / Pin / AskAI). Core only produces payloads; dispatch is the caller's job."
+
+[dependencies]
+capture-core.workspace = true
+capture-annotation.workspace = true
+capture-render.workspace = true
+thiserror.workspace = true

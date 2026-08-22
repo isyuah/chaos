@@ -1,0 +1,23 @@
+[package]
+name = "capture-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI acceptance tool for the frozen capture Core."
+
+[[bin]]
+name = "capture-cli"
+path = "src/main.rs"
+
+[dependencies]
+capture-core.workspace = true
+capture-platform-api.workspace = true
+capture-annotation.workspace = true
+capture-render.workspace = true
+capture-actions.workspace = true
+capture-windows.workspace = true
+capture-linux.workspace = true
+clap.workspace = true
+arboard = "3"

@@ -1,0 +1,12 @@
+[package]
+name = "capture-platform-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Formal capture/snap backend abstraction traits for the screenshot demo."
+
+[dependencies]
+capture-core.workspace = true
+thiserror.workspace = true

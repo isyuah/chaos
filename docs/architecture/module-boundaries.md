@@ -1,0 +1,120 @@
+# Module Boundaries
+
+This document is the authoritative description of the shared Rust Core crate
+graph. It is intentionally written before the code so that the two UI frontends
+(`capture-slint`, `capture-qml`) can rely on a stable contract.
+
+## 1. Dependency direction
+
+```text
+platform implementations (capture-windows, capture-linux)
+        ↓
+capture-platform-api            (traits only, no platform impls)
+        ↓
+capture-core                   (geometry, capture/snap data types, placement)
+     ↙          ↘
+capture-annotation  capture-actions
+     ↓
+  capture-render
+```
+
+The actual crate dependency edges are:
+
+| Crate | Depends on |
+|---|---|
+| `capture-core` | *(nothing — std + `thiserror` only)* |
+| `capture-platform-api` | `capture-core` |
+| `capture-annotation` | `capture-core` |
+| `capture-render` | `capture-core`, `capture-annotation` |
+| `capture-actions` | `capture-core`, `capture-annotation`, `capture-render` |
+| `capture-windows` | `capture-core`, `capture-platform-api`, `windows` |
+| `capture-linux` | `capture-core`, `capture-platform-api` |
+| `tools/capture-cli` | all of the above |
+
+No crate in this graph depends on a UI toolkit (Slint, Qt/QML, winit, tao).
+Platform native types (`HWND`, X11/`Wayland` handles) never escape the
+`capture-windows` / `capture-linux` crates; they are converted to opaque
+`u64`/`PhysicalPoint` values at the API boundary.
+
+## 2. Crate responsibilities
+
+### `capture-core`
+UI-neutral, platform-neutral, toolkit-free. The canonical coordinate space is
+**physical pixels**.
+
+- `geometry` — `PhysicalPoint`, `PhysicalSize`, `PhysicalRect`, `ScaleFactor`,
+  plus `intersection`, `clamp`, `translate`, `contains`, `inflate`, `normalize`,
+  and negative-virtual-coordinate helpers.
+- `coord` — `CoordinateMapper` and the physical↔logical contract for mixed-DPI.
+- `capture` — `PixelFormat`, `CapturedFrame`, `MonitorId`, `MonitorInfo`,
+  `CaptureCapabilities`, `CaptureError`.
+- `snap` — `SnapKind`, `SnapCandidateId`, `SnapCandidate`, `SnapCapabilities`,
+  `SnapError`, `SnapExclusionToken`.
+- `placement` — `place_toolbar`, `ToolbarPlacement`, `ToolbarPlacementReason`.
+- `selection` — pure selection geometry state (`SelectionSession`,
+  `SelectionTool`, resize handle ids). Contains **no** annotation document.
+
+### `capture-platform-api`
+The formal abstraction surface. Defines `CaptureBackend` and `SnapBackend`
+traits. Uses only `capture-core` types. No implementation code.
+
+### `capture-annotation`
+The annotation document (`Annotation`, `PenStroke`, `RectShape`,
+`CaptureDocument`), the undo stack, and the **capture session state machine**
+(`CaptureCommand`, `CaptureEvent`, `CaptureSessionState`, `CaptureSession`).
+
+> Rationale for the session being here rather than in `capture-core`: the
+> `Editing(EditorSession)` state must hold a `CaptureDocument`, whose
+> `annotations: Vec<Annotation>` lives in this crate. Placing the session here
+> preserves the rule that `capture-core` never depends on `capture-annotation`
+> (which would create a cycle), while still leaving the whole diagram
+> dependency-correct (`annotation → core`).
+
+### `capture-render`
+Flattens a `CaptureDocument` (source frame + crop + annotations) into a final
+RGBA8 bitmap, and encodes it to PNG. Golden tests live here.
+
+### `capture-actions`
+`CaptureAction` trait plus `Copy`, `Save`, `Pin`, `AskAi` actions. Actions only
+**produce payloads** (bytes + metadata); writing to the OS clipboard or creating
+a Pin window is deferred to the caller (frontend shell) exactly as the spec
+requires — Core never touches a UI event loop.
+
+### `capture-windows`
+Implements `CaptureBackend` (GDI `BitBlt` screen capture) and `SnapBackend`
+(visible top-level-window enumeration + point hit-testing). All `unsafe` and
+all `HWND`/`HDC` handling is confined here.
+
+### `capture-linux`
+Provides the same two traits behind `#[cfg(target_os = "linux")]`. For the demo
+it is a compilable skeleton that documents the X11/Wayland route and returns
+clear `CaptureError::Unsupported` results rather than silently misbehaving.
+
+## 3. What each frontend implements (NOT in Core)
+
+Per `00_DEMO_COMMON_SPEC.md` §17, the following are experiment variables and
+intentionally absent from Core:
+
+- window creation, transparency / frameless / topmost integration
+- native window handle conversion (`*mut c_void` → toolkit handle)
+- multi-window lifecycle, Pin Window
+- image bridge: `CapturedFrame` → toolkit image/texture
+- toolbar rendering, selection visual rendering, annotation preview rendering
+- animation, input dispatch adapter, first-present measurement
+
+## 4. Contract for adding a frontend
+
+A frontend:
+
+1. Creates an app package (e.g. `apps/capture-slint`), adds it to the workspace
+   member list, and depends on `capture-core`/`capture-platform-api`/
+   `capture-annotation`/`capture-render`/`capture-actions`.
+2. Selects a backend: `capture-windows::WindowsPlatform` on Windows,
+   `capture-linux::LinuxPlatform` elsewhere (the CLI's `platform` module shows
+   the one-line wiring).
+3. Consumes `CaptureBackend`/`SnapBackend` through `&dyn` (they are object-safe).
+4. Passes its native window handle into `SnapBackend::set_excluded_window` as a
+   `SnapExclusionToken` derived from its HWND value.
+
+If the frozen Core API blocks a reasonable implementation, the frontend
+follows `CORE_CHANGE_REQUEST.md` instead of silently forking Core.

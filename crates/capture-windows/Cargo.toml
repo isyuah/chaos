@@ -1,0 +1,14 @@
+[package]
+name = "capture-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Windows capture + snap backend (GDI BitBlt / window enumeration)."
+
+[target.'cfg(windows)'.dependencies]
+capture-core.workspace = true
+capture-platform-api.workspace = true
+thiserror.workspace = true
+windows.workspace = true

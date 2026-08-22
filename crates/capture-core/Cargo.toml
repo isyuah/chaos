@@ -1,0 +1,11 @@
+[package]
+name = "capture-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "UI-neutral, platform-neutral domain core for the screenshot capture visualisation demo."
+
+[dependencies]
+thiserror.workspace = true

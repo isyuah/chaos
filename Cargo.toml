@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capture-core",
+    "crates/capture-platform-api",
+    "crates/capture-annotation",
+    "crates/capture-render",
+    "crates/capture-actions",
+    "crates/capture-windows",
+    "crates/capture-linux",
+    "tools/capture-cli",
+]
+
+# The UI experiment apps (apps/capture-slint, apps/capture-qml) are created by
+# their own agents and are intentionally NOT members here yet. They build against
+# the frozen Core API described in CORE_BASELINE_REPORT.md. When a UI agent adds
+# its app, it appends its package path to this member list and runs `cargo build`.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Snow Shot capture-ui-eval core team"]
+
+[workspace.dependencies]
+capture-core = { path = "crates/capture-core" }
+capture-platform-api = { path = "crates/capture-platform-api" }
+capture-annotation = { path = "crates/capture-annotation" }
+capture-render = { path = "crates/capture-render" }
+capture-actions = { path = "crates/capture-actions" }
+capture-windows = { path = "crates/capture-windows" }
+capture-linux = { path = "crates/capture-linux" }
+
+thiserror = "2"
+png = "0.17"
+clap = { version = "4", features = ["derive"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

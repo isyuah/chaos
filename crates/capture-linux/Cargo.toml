@@ -1,0 +1,13 @@
+[package]
+name = "capture-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Linux (X11/Wayland) capture + snap backend skeleton."
+
+[target.'cfg(target_os = "linux")'.dependencies]
+capture-core.workspace = true
+capture-platform-api.workspace = true
+thiserror.workspace = true
