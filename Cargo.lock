@@ -761,6 +761,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture-runtime"
+version = "0.1.0"
+dependencies = [
+ "capture-annotation",
+ "capture-core",
+]
+
+[[package]]
 name = "capture-slint"
 version = "0.1.0"
 dependencies = [
@@ -771,6 +779,7 @@ dependencies = [
  "capture-linux",
  "capture-platform-api",
  "capture-render",
+ "capture-runtime",
  "capture-windows",
  "raw-window-handle",
  "slint",

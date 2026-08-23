@@ -1,14 +1,14 @@
 # Event Flow
 
 This document describes the command/event flow through the shared Core
-(`capture-annotation`'s `CaptureSession`). The frontend is the *driver*: it owns
-pointer/keyboard events and calls commands; the Core owns the **state** and
-mutates the annotation document. The frontend subscribes to events and decides
-how to render.
+(`capture-annotation`'s `CaptureSession`) and the application driver in
+`capture-runtime`. The frontend owns pointer/keyboard translation and renders
+the state, while the runtime is the single application-level command boundary.
 
 ## 1. Driver model
 
-The frontend (or the CLI) is responsible for:
+The application shell (or a future user-facing application CLI) is responsible
+for:
 
 - capturing the frame (`CaptureBackend::capture_monitor`) and delivering it as
   `CaptureCommand::FrameReady(CapturedFrame)`;
@@ -23,6 +23,26 @@ The frontend (or the CLI) is responsible for:
 The Core is responsible for: transition validity, selection geometry mutation,
 document/annotation mutation, undo, action invocation, and reporting
 `CaptureEvent`s.
+
+The runtime wraps those commands/events without translating them into toolkit
+concepts. It also applies application settings and turns action completion into
+policy events such as `CloseOverlay`.
+
+```text
+Slint / hotkey / app CLI / IPC
+          │ RuntimeCommand
+          ▼
+    capture-runtime
+          │ CaptureCommand
+          ▼
+    CaptureSession
+          │ CaptureEvent
+          ▼
+    RuntimeEvent
+          │
+          ├─ shell rendering / clipboard / windows
+          └─ trusted plugin event dispatch
+```
 
 ## 2. State machine
 

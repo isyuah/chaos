@@ -11,6 +11,7 @@ description = "Slint frontend for the shared screenshot capture Core."
 capture-core.workspace = true
 capture-platform-api.workspace = true
 capture-annotation.workspace = true
+capture-runtime.workspace = true
 capture-render.workspace = true
 capture-actions.workspace = true
 capture-windows.workspace = true

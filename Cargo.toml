@@ -4,6 +4,7 @@ members = [
     "crates/capture-core",
     "crates/capture-platform-api",
     "crates/capture-annotation",
+    "crates/capture-runtime",
     "crates/capture-render",
     "crates/capture-actions",
     "crates/capture-windows",
@@ -27,6 +28,7 @@ authors = ["Snow Shot capture-ui-eval core team"]
 capture-core = { path = "crates/capture-core" }
 capture-platform-api = { path = "crates/capture-platform-api" }
 capture-annotation = { path = "crates/capture-annotation" }
+capture-runtime = { path = "crates/capture-runtime" }
 capture-render = { path = "crates/capture-render" }
 capture-actions = { path = "crates/capture-actions" }
 capture-windows = { path = "crates/capture-windows" }

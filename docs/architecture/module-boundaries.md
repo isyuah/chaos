@@ -12,10 +12,11 @@ platform implementations (capture-windows, capture-linux)
 capture-platform-api            (traits only, no platform impls)
         ↓
 capture-core                   (geometry, capture/snap data types, placement)
-     ↙          ↘
-capture-annotation  capture-actions
      ↓
-  capture-render
+capture-annotation
+     ├──────────────→ capture-runtime
+     ├──────────────→ capture-render
+     └──────────────→ capture-actions
 ```
 
 The actual crate dependency edges are:
@@ -25,12 +26,13 @@ The actual crate dependency edges are:
 | `capture-core` | *(nothing — std + `thiserror` only)* |
 | `capture-platform-api` | `capture-core` |
 | `capture-annotation` | `capture-core` |
+| `capture-runtime` | `capture-core`, `capture-annotation` |
 | `capture-render` | `capture-core`, `capture-annotation` |
 | `capture-actions` | `capture-core`, `capture-annotation`, `capture-render` |
 | `capture-windows` | `capture-core`, `capture-platform-api`, `windows` |
 | `capture-linux` | `capture-core`, `capture-platform-api` |
-| `tools/capture-cli` | all of the above |
-| `apps/capture-slint` | all Core crates, platform adapters, Slint, clipboard bridge |
+| `tools/capture-cli` | Core crates, platform adapters (diagnostic/acceptance path) |
+| `apps/capture-slint` | runtime, Core crates, platform adapters, Slint, clipboard bridge |
 
 No crate in this graph depends on a UI toolkit (Slint, Qt/QML, winit, tao).
 The last statement applies to the shared Core graph; `apps/capture-slint` is the
@@ -79,6 +81,23 @@ The annotation document (`Annotation`, `PenStroke`, `RectShape`,
 Flattens a `CaptureDocument` (source frame + crop + annotations) into a final
 RGBA8 bitmap, and encodes it to PNG. Golden tests live here.
 
+### `capture-runtime`
+
+Owns the application-level session driver and policy above the capture domain:
+
+- `AppSettings` and behavior such as whether a successful copy closes the overlay;
+- `RuntimeCommand` / `RuntimeEvent`, shared by the resident app, settings UI,
+  future hotkey adapters, application CLI integration, and optional IPC;
+- the trusted in-process `RuntimePlugin` boundary and plugin action registry.
+
+It is UI- and platform-neutral. It does not create windows, register global
+hotkeys, write the clipboard, persist settings, or dynamically load plugins.
+Those are host responsibilities. See `runtime-and-plugins.md`.
+
+The existing `tools/capture-cli` intentionally remains a low-level diagnostic
+and acceptance tool that can exercise Core and platform adapters directly. A
+future user-facing application CLI should call `capture-runtime` instead.
+
 ### `capture-actions`
 `CaptureAction` trait plus `Copy`, `Save`, `Pin`, `AskAi` actions. Actions only
 **produce payloads** (bytes + metadata); writing to the OS clipboard or creating
@@ -116,8 +135,8 @@ A frontend:
 
 1. Uses the `apps/capture-slint` package (or creates a future frontend package),
    adds it to the workspace member list, and depends on
-   `capture-core`/`capture-platform-api`/`capture-annotation`/`capture-render`/
-   `capture-actions`.
+   `capture-runtime`/`capture-core`/`capture-platform-api`/
+   `capture-annotation`/`capture-render`/`capture-actions`.
 2. Selects a backend: `capture-windows::WindowsPlatform` on Windows,
    `capture-linux::LinuxPlatform` elsewhere (the CLI's `platform` module shows
    the one-line wiring).

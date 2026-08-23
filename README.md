@@ -11,6 +11,7 @@ Core is implemented **once**; the two frontends (`apps/capture-slint`,
 crates/capture-core          geometry (+negative coords), capture/snap data, placement, ActionId
 crates/capture-platform-api   CaptureBackend + SnapBackend traits
 crates/capture-annotation     annotation document, undo, capture session state machine
+crates/capture-runtime        app settings, lifecycle commands/events, plugin boundary
 crates/capture-render         flatten + PNG encode + golden tests
 crates/capture-actions        Copy / Save / Pin / AskAI payloads
 crates/capture-windows        GDI capture + window snap (real)

@@ -3,16 +3,18 @@
 use arboard::{Clipboard, ImageData};
 use capture_actions::{ActionOutcome, CaptureAction, CopyAction, PinAction, SaveAction};
 use capture_annotation::{
-    Annotation, AnnotationTool, CaptureCommand, CaptureEvent, CaptureSession, CaptureSessionState,
+    Annotation, AnnotationTool, CaptureCommand, CaptureEvent, CaptureSessionState,
 };
 use capture_core::capture::CapturedFrame;
 use capture_core::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
 use capture_core::selection::{ResizeHandle, SelectionInteraction, SelectionSession};
 use capture_core::{
-    place_toolbar, MonitorInfo, SnapCandidate, SnapExclusionToken, SnapKind, ToolbarPlacementReason,
+    place_toolbar, ActionId, MonitorInfo, SnapCandidate, SnapExclusionToken, SnapKind,
+    ToolbarPlacementReason,
 };
 use capture_platform_api::{CaptureBackend, SnapBackend};
 use capture_render::flatten;
+use capture_runtime::{CaptureRuntime, RuntimeCommand, RuntimeEvent};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
@@ -147,7 +149,7 @@ impl HostPlatform {
 
 struct Controller {
     host: HostPlatform,
-    session: CaptureSession,
+    runtime: CaptureRuntime,
     frame: Arc<CapturedFrame>,
     log: TraceLog,
     scale_factor: f64,
@@ -299,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log.duration("startup.window_set_position", window_position_started);
     let state = Rc::new(RefCell::new(Controller {
         host,
-        session: CaptureSession::new(),
+        runtime: CaptureRuntime::default(),
         frame: frame.clone(),
         log: log.clone(),
         scale_factor: ui_scale_hint,
@@ -323,14 +325,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut controller = state.borrow_mut();
         let initial_refresh_started = Instant::now();
         let session_begin_started = Instant::now();
-        controller.session.apply(CaptureCommand::Begin);
+        controller.dispatch_runtime(RuntimeCommand::BeginCapture);
         controller
             .log
             .duration("startup.session_begin", session_begin_started);
         let session_frame_started = Instant::now();
-        controller
-            .session
-            .apply(CaptureCommand::FrameReady((*frame).clone()));
+        controller.dispatch_runtime(RuntimeCommand::Capture(CaptureCommand::FrameReady(
+            (*frame).clone(),
+        )));
         controller
             .log
             .duration("startup.session_frame_ready", session_frame_started);
@@ -363,17 +365,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "x={x:.1} y={y:.1} physical=({}, {}) state={}",
                     point.x,
                     point.y,
-                    state_label(controller.session.state())
+                    state_label(controller.runtime.state())
                 ),
             );
 
             controller.last_pointer = Some(point);
             ui.set_canvas_cursor_kind(cursor_kind_for_point(&controller, point).into());
-            match controller.session.state() {
+            match controller.runtime.state() {
                 CaptureSessionState::Selecting(selection)
                     if selection.interaction == SelectionInteraction::Hovering
                         && controller
-                            .session
+                            .runtime
                             .hover_candidate()
                             .is_some_and(is_committable_snap) =>
                 {
@@ -428,12 +430,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             controller.pointer_moves = controller.pointer_moves.saturating_add(1);
             let gesture = controller.pointer_gesture;
             let dragging = matches!(
-                controller.session.state(),
+                controller.runtime.state(),
                 CaptureSessionState::Selecting(selection)
                     if selection.interaction == SelectionInteraction::Dragging
             );
             if matches!(
-                controller.session.state(),
+                controller.runtime.state(),
                 CaptureSessionState::Selecting(_)
             ) {
                 if !dragging && controller.should_query_snap() {
@@ -480,7 +482,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if dragging {
                     controller.apply(CaptureCommand::UpdateFreeSelection(point));
                 }
-            } else if matches!(controller.session.state(), CaptureSessionState::Editing(_)) {
+            } else if matches!(controller.runtime.state(), CaptureSessionState::Editing(_)) {
                 match gesture {
                     Some(PointerGesture::Move) => {
                         if let Some(last) = controller.last_pointer {
@@ -515,7 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         controller.pointer_moves,
                         point.x,
                         point.y,
-                        state_label(controller.session.state()),
+                        state_label(controller.runtime.state()),
                     ),
                 );
             }
@@ -532,7 +534,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut controller = state.borrow_mut();
             let started = Instant::now();
             let point = controller.to_physical(x, y);
-            match controller.session.state() {
+            match controller.runtime.state() {
                 CaptureSessionState::Selecting(_) => {
                     controller.apply(CaptureCommand::CommitSelection)
                 }
@@ -708,7 +710,7 @@ fn state_label(state: &CaptureSessionState) -> &'static str {
 }
 
 fn cursor_kind_for_point(controller: &Controller, point: PhysicalPoint) -> &'static str {
-    let CaptureSessionState::Editing(editor) = controller.session.state() else {
+    let CaptureSessionState::Editing(editor) = controller.runtime.state() else {
         return "default";
     };
     if editor.selected_tool != AnnotationTool::Pointer {
@@ -740,7 +742,7 @@ fn input_origin(_state: &CaptureSessionState, frame_origin: PhysicalPoint) -> Ph
 impl Controller {
     fn to_physical(&self, x: f32, y: f32) -> capture_core::PhysicalPoint {
         let frame = self.frame.as_ref();
-        let origin = input_origin(self.session.state(), frame.origin);
+        let origin = input_origin(self.runtime.state(), frame.origin);
         PhysicalPoint::new(
             origin
                 .x
@@ -782,11 +784,21 @@ impl Controller {
     }
 
     fn apply(&mut self, command: CaptureCommand) {
-        for event in self.session.apply(command) {
-            if let CaptureEvent::Error(error) = event {
-                self.set_status(error.to_string());
+        self.dispatch_runtime(RuntimeCommand::Capture(command));
+    }
+
+    fn dispatch_runtime(&mut self, command: RuntimeCommand) -> Vec<RuntimeEvent> {
+        let events = self.runtime.dispatch(command);
+        for event in &events {
+            match event {
+                RuntimeEvent::Session(CaptureEvent::Error(error)) => {
+                    self.set_status(error.to_string())
+                }
+                RuntimeEvent::StatusChanged(message) => self.set_status(message.clone()),
+                _ => {}
             }
         }
+        events
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -823,7 +835,7 @@ impl Controller {
             "action.begin",
             format!(
                 "action={action} state={}",
-                state_label(self.session.state())
+                state_label(self.runtime.state())
             ),
         );
         match action {
@@ -854,94 +866,143 @@ impl Controller {
                 self.log.duration("shutdown.cancel.quit", quit_started);
                 return;
             }
-            "copy" => {
-                let Some(document) = self.document() else {
-                    return;
+            "copy" | "save" | "pin" | "ask-ai" => {
+                let action_id = match action {
+                    "copy" => ActionId::COPY,
+                    "save" => ActionId::SAVE,
+                    "pin" => ActionId::PIN,
+                    "ask-ai" => ActionId::ASK_AI,
+                    _ => unreachable!(),
                 };
-                match CopyAction.invoke(&document) {
-                    Ok(ActionOutcome::Png(_)) => match copy_document_to_clipboard(&document) {
-                        Ok(()) => self.set_status("已复制到剪贴板"),
-                        Err(error) => self.set_status(format!("复制失败：{error}")),
-                    },
-                    Ok(_) => self.set_status("复制失败：返回了未知结果"),
-                    Err(error) => self.set_status(format!("复制失败：{error}")),
-                }
-            }
-            "save" => {
-                let Some(document) = self.document() else {
-                    return;
-                };
-                let path = PathBuf::from("capture-slint.png");
-                match SaveAction::new(&path).invoke(&document) {
-                    Ok(ActionOutcome::Saved(path)) => {
-                        self.set_status(format!("已保存到 {}", path.display()))
+                let events = self.dispatch_runtime(RuntimeCommand::Capture(
+                    CaptureCommand::InvokeAction(action_id),
+                ));
+                for event in events {
+                    if let RuntimeEvent::ActionRequested(requested) = event {
+                        self.execute_builtin_action(requested, ui);
                     }
-                    Ok(_) => self.set_status("保存完成"),
-                    Err(error) => self.set_status(format!("保存失败：{error}")),
                 }
             }
-            "pin" => {
-                let Some(document) = self.document() else {
-                    return;
-                };
-                match PinAction.invoke(&document) {
-                    Ok(ActionOutcome::Pin(_payload)) => match PinWindow::new() {
-                        Ok(pin) => {
-                            let rendered = match flatten(&document) {
-                                Ok(rendered) => rendered,
-                                Err(error) => {
-                                    self.set_status(format!("固定截图渲染失败：{error}"));
-                                    return refresh_editor_ui(ui, self, false);
-                                }
-                            };
-                            let image =
-                                image_from_rgba(rendered.width, rendered.height, &rendered.pixels);
-                            pin.set_pin_image(image);
-                            pin.window().set_size(slint::PhysicalSize::new(
-                                rendered.width,
-                                rendered.height,
-                            ));
-                            pin.window().set_position(slint::PhysicalPosition::new(
-                                document.crop.origin.x.saturating_add(16),
-                                document.crop.origin.y.saturating_add(16),
-                            ));
-                            let pin_weak = pin.as_weak();
-                            pin.on_close_requested(move || {
-                                if let Some(pin) = pin_weak.upgrade() {
-                                    let _ = pin.hide();
-                                }
-                            });
-                            let _ = pin.show();
-                            self.pin_window = Some(pin);
-                            self.set_status("截图已固定为浮动窗口");
-                        }
-                        Err(error) => self.set_status(format!("固定窗口创建失败：{error}")),
-                    },
-                    Ok(_) => self.set_status("固定完成"),
-                    Err(error) => self.set_status(format!("固定失败：{error}")),
-                }
-            }
-            "ask-ai" => self.set_status("AI 功能尚未接入"),
             _ => {}
         }
-        if matches!(self.session.state(), CaptureSessionState::Editing(_)) {
+        if matches!(self.runtime.state(), CaptureSessionState::Editing(_)) {
             refresh_editor_ui(ui, self, false);
         } else {
             refresh_ui(ui, self);
         }
     }
 
-    fn document(&self) -> Option<capture_annotation::CaptureDocument> {
-        match self.session.state() {
-            CaptureSessionState::Editing(editor) => Some(editor.document.clone()),
-            _ => None,
+    fn execute_builtin_action(&mut self, action: ActionId, ui: &CaptureWindow) {
+        let Some(document) = self.document() else {
+            return;
+        };
+        match action {
+            ActionId::COPY => match CopyAction.invoke(&document) {
+                Ok(ActionOutcome::Png(_)) => match copy_document_to_clipboard(&document) {
+                    Ok(()) => self.complete_action(action, true, "已复制到剪贴板", ui),
+                    Err(error) => {
+                        self.complete_action(action, false, format!("复制失败：{error}"), ui)
+                    }
+                },
+                Ok(_) => self.complete_action(action, false, "复制失败：返回了未知结果", ui),
+                Err(error) => self.complete_action(action, false, format!("复制失败：{error}"), ui),
+            },
+            ActionId::SAVE => {
+                let path = self
+                    .runtime
+                    .settings()
+                    .save_directory
+                    .join("capture-slint.png");
+                match SaveAction::new(&path).invoke(&document) {
+                    Ok(ActionOutcome::Saved(path)) => self.complete_action(
+                        action,
+                        true,
+                        format!("已保存到 {}", path.display()),
+                        ui,
+                    ),
+                    Ok(_) => self.complete_action(action, true, "保存完成", ui),
+                    Err(error) => {
+                        self.complete_action(action, false, format!("保存失败：{error}"), ui)
+                    }
+                }
+            }
+            ActionId::PIN => match PinAction.invoke(&document) {
+                Ok(ActionOutcome::Pin(_payload)) => match PinWindow::new() {
+                    Ok(pin) => {
+                        let rendered = match flatten(&document) {
+                            Ok(rendered) => rendered,
+                            Err(error) => {
+                                self.complete_action(
+                                    action,
+                                    false,
+                                    format!("固定截图渲染失败：{error}"),
+                                    ui,
+                                );
+                                return;
+                            }
+                        };
+                        let image =
+                            image_from_rgba(rendered.width, rendered.height, &rendered.pixels);
+                        pin.set_pin_image(image);
+                        pin.window()
+                            .set_size(slint::PhysicalSize::new(rendered.width, rendered.height));
+                        pin.window().set_position(slint::PhysicalPosition::new(
+                            document.crop.origin.x.saturating_add(16),
+                            document.crop.origin.y.saturating_add(16),
+                        ));
+                        let pin_weak = pin.as_weak();
+                        pin.on_close_requested(move || {
+                            if let Some(pin) = pin_weak.upgrade() {
+                                let _ = pin.hide();
+                            }
+                        });
+                        let _ = pin.show();
+                        self.pin_window = Some(pin);
+                        self.complete_action(action, true, "截图已固定为浮动窗口", ui);
+                    }
+                    Err(error) => self.complete_action(
+                        action,
+                        false,
+                        format!("固定窗口创建失败：{error}"),
+                        ui,
+                    ),
+                },
+                Ok(_) => self.complete_action(action, true, "固定完成", ui),
+                Err(error) => self.complete_action(action, false, format!("固定失败：{error}"), ui),
+            },
+            ActionId::ASK_AI => self.complete_action(action, false, "AI 功能尚未接入", ui),
+            _ => {}
         }
+    }
+
+    fn complete_action(
+        &mut self,
+        action: ActionId,
+        success: bool,
+        message: impl Into<String>,
+        ui: &CaptureWindow,
+    ) {
+        let events = self.dispatch_runtime(RuntimeCommand::ActionCompleted {
+            action,
+            success,
+            message: Some(message.into()),
+        });
+        if events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::CloseOverlay))
+        {
+            let _ = ui.hide();
+        }
+    }
+
+    fn document(&self) -> Option<capture_annotation::CaptureDocument> {
+        self.runtime.document()
     }
 }
 
 fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
     let started = Instant::now();
-    match controller.session.state() {
+    match controller.runtime.state() {
         CaptureSessionState::Selecting(_) => {
             let image_started = Instant::now();
             ui.set_frame_image(image_from_frame(&controller.frame));
@@ -954,7 +1015,7 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
                 "render.refresh_ui",
                 format!(
                     "state={} duration_ms={:.3}",
-                    state_label(controller.session.state()),
+                    state_label(controller.runtime.state()),
                     started.elapsed().as_secs_f64() * 1000.0
                 ),
             );
@@ -973,14 +1034,14 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
         "render.refresh_ui",
         format!(
             "state={} duration_ms={:.3}",
-            state_label(controller.session.state()),
+            state_label(controller.runtime.state()),
             started.elapsed().as_secs_f64() * 1000.0
         ),
     );
 }
 
 fn refresh_pointer_visuals(ui: &CaptureWindow, controller: &Controller) {
-    match controller.session.state() {
+    match controller.runtime.state() {
         CaptureSessionState::Selecting(_) => refresh_selection_geometry(ui, controller),
         CaptureSessionState::Editing(_) => {
             refresh_selection_geometry(ui, controller);
@@ -992,7 +1053,7 @@ fn refresh_pointer_visuals(ui: &CaptureWindow, controller: &Controller) {
 
 fn refresh_editor_ui(ui: &CaptureWindow, controller: &Controller, refresh_base: bool) {
     let started = Instant::now();
-    let CaptureSessionState::Editing(editor) = controller.session.state() else {
+    let CaptureSessionState::Editing(editor) = controller.runtime.state() else {
         refresh_ui(ui, controller);
         return;
     };
@@ -1023,7 +1084,7 @@ fn refresh_editor_base(ui: &CaptureWindow, controller: &Controller) {
 }
 
 fn refresh_editor_overlay(ui: &CaptureWindow, controller: &Controller) {
-    let (path, width, visible) = match controller.session.state() {
+    let (path, width, visible) = match controller.runtime.state() {
         CaptureSessionState::Editing(editor) => {
             let mut path = String::new();
             let mut width = 0.0;
@@ -1051,7 +1112,7 @@ fn refresh_editor_overlay(ui: &CaptureWindow, controller: &Controller) {
 }
 
 fn refresh_selection_geometry(ui: &CaptureWindow, controller: &Controller) {
-    let (rect, editing, tool, window_origin, toolbar) = match controller.session.state() {
+    let (rect, editing, tool, window_origin, toolbar) = match controller.runtime.state() {
         CaptureSessionState::Selecting(selection) => (
             selection.rect,
             false,
@@ -1176,7 +1237,7 @@ fn moved_enough(start: PhysicalPoint, current: PhysicalPoint) -> bool {
 }
 
 fn editor_layout(controller: &Controller) -> Option<EditorLayout> {
-    let CaptureSessionState::Editing(editor) = controller.session.state() else {
+    let CaptureSessionState::Editing(editor) = controller.runtime.state() else {
         return None;
     };
     let selection = editor.document.crop;
@@ -1293,19 +1354,19 @@ mod tests {
             PhysicalPoint::new(-2560, 0),
             PixelFormat::Rgba8,
         );
-        let mut session = CaptureSession::new();
-        session.apply(CaptureCommand::Begin);
-        session.apply(CaptureCommand::FrameReady(frame));
-        session.apply(CaptureCommand::BeginFreeSelection(PhysicalPoint::new(
-            -2300, 100,
-        )));
-        session.apply(CaptureCommand::UpdateFreeSelection(PhysicalPoint::new(
-            -2100, 240,
-        )));
-        session.apply(CaptureCommand::CommitSelection);
+        let mut runtime = CaptureRuntime::default();
+        runtime.dispatch(RuntimeCommand::BeginCapture);
+        for command in [
+            CaptureCommand::FrameReady(frame),
+            CaptureCommand::BeginFreeSelection(PhysicalPoint::new(-2300, 100)),
+            CaptureCommand::UpdateFreeSelection(PhysicalPoint::new(-2100, 240)),
+            CaptureCommand::CommitSelection,
+        ] {
+            runtime.dispatch(RuntimeCommand::Capture(command));
+        }
 
         assert_eq!(
-            input_origin(session.state(), PhysicalPoint::new(-2560, 0)),
+            input_origin(runtime.state(), PhysicalPoint::new(-2560, 0)),
             PhysicalPoint::new(-2560, 0)
         );
     }
