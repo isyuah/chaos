@@ -61,6 +61,12 @@ component ToolbarGlyph inherits Rectangle {
         commands: "M 4 4 L 16 16 M 16 4 L 4 16";
         fill: transparent; stroke: root.glyph-color; stroke-width: 2px;
     }
+    if kind == "chevron-down": Path {
+        x: 4px; y: 6px; width: 12px; height: 8px;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 12; viewbox-height: 8;
+        commands: "M 1 1 L 6 6 L 11 1";
+        fill: transparent; stroke: root.glyph-color; stroke-width: 1.8px;
+    }
 }
 
 component ToolbarButton inherits Rectangle {
@@ -88,6 +94,132 @@ component ToolbarButton inherits Rectangle {
     }
 }
 
+component ToolbarMenuItem inherits Rectangle {
+    in property <string> label;
+    callback activated;
+
+    height: 36px;
+    border-radius: 5px;
+    background: menu-touch.has-hover ? #f1f5f9 : transparent;
+    Text {
+        x: 12px;
+        width: parent.width - 24px;
+        height: parent.height;
+        text: root.label;
+        color: #334155;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    menu-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+}
+
+component SaveSplitButton inherits Rectangle {
+    callback run-action(string);
+
+    min-width: 56px;
+    max-width: 56px;
+    preferred-width: 56px;
+    min-height: 36px;
+    max-height: 36px;
+    preferred-height: 36px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #d5dce5;
+    background: #ffffff;
+
+    save-main := Rectangle {
+        x: 0px;
+        width: 36px;
+        height: parent.height;
+        border-radius: 8px;
+        background: save-touch.has-hover ? #f1f5f9 : transparent;
+        save-touch := TouchArea {
+            x: 0px;
+            y: 0px;
+            width: 36px;
+            height: 36px;
+            mouse-cursor: pointer;
+            clicked => { root.run-action("save"); }
+            Tooltip { text: @markdown("保存到默认位置"); }
+        }
+    }
+    ToolbarGlyph {
+        x: 8px;
+        y: 8px;
+        kind: "save";
+        glyph-color: #334155;
+    }
+    Rectangle {
+        x: 36px;
+        y: 5px;
+        width: 1px;
+        height: 26px;
+        background: #e2e8f0;
+    }
+    save-dropdown := Rectangle {
+        x: 37px;
+        width: 19px;
+        height: parent.height;
+        border-radius: 8px;
+        background: dropdown-touch.has-hover ? #f1f5f9 : transparent;
+        dropdown-touch := TouchArea {
+            x: 0px;
+            y: 0px;
+            width: 19px;
+            height: 36px;
+            mouse-cursor: pointer;
+            clicked => { save-menu.show(); }
+            Tooltip { text: @markdown("更多保存方式"); }
+        }
+    }
+    ToolbarGlyph {
+        x: 37px;
+        y: 8px;
+        kind: "chevron-down";
+        glyph-color: #64748b;
+    }
+
+    save-menu := PopupWindow {
+        x: -154px;
+        y: -88px;
+        width: 210px;
+        height: 82px;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #d5dce5;
+            border-radius: 7px;
+            drop-shadow-offset-y: 3px;
+            drop-shadow-blur: 10px;
+            drop-shadow-color: #00000024;
+
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+                ToolbarMenuItem {
+                    label: "保存并打开所在位置";
+                    activated => {
+                        save-menu.close();
+                        root.run-action("save-open");
+                    }
+                }
+                ToolbarMenuItem {
+                    label: "另存为...";
+                    activated => {
+                        save-menu.close();
+                        root.run-action("save-as");
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component CaptureWindow inherits Window {
     in property <bool> warmup;
     in property <image> frame-image;
@@ -109,6 +241,17 @@ export component CaptureWindow inherits Window {
     in property <string> canvas-cursor-kind;
     in property <string> toolbar-cursor-kind;
     in property <int> status-revision;
+    in property <string> selection-info-text;
+    in property <float> selection-info-x;
+    in property <float> selection-info-y;
+    in property <bool> selection-info-visible;
+    in property <float> inspector-x;
+    in property <float> inspector-y;
+    in property <image> inspector-image;
+    in property <color> inspector-color;
+    in property <string> inspector-color-text;
+    in property <string> inspector-position-text;
+    in property <bool> inspector-visible;
     private property <bool> toast-visible;
 
     callback pointer-down(float, float);
@@ -119,6 +262,7 @@ export component CaptureWindow inherits Window {
     callback toolbar-pointer-down(float, float);
     callback toolbar-pointer-move(float, float);
     callback toolbar-pointer-up();
+    callback inspector-key-pressed(string, bool, bool, bool, bool, bool) -> bool;
 
     changed status-revision => {
         if (root.status != "") {
@@ -139,6 +283,25 @@ export component CaptureWindow inherits Window {
     no-frame: true;
     always-on-top: true;
     background: root.warmup ? transparent : #101318;
+    forward-focus: overlay-keys;
+
+    overlay-keys := FocusScope {
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        key-pressed(event) => {
+            if (root.inspector-key-pressed(
+                event.text,
+                event.modifiers.control,
+                event.modifiers.alt,
+                event.modifiers.shift,
+                event.modifiers.meta,
+                event.repeat,
+            )) {
+                return accept;
+            }
+            return reject;
+        }
+    }
 
     Rectangle {
         visible: !root.warmup;
@@ -231,10 +394,133 @@ export component CaptureWindow inherits Window {
         }
 
         Rectangle {
+            visible: root.selection-info-visible;
+            x: root.selection-info-x * 1px;
+            y: root.selection-info-y * 1px;
+            width: 230px;
+            height: 30px;
+            border-radius: 6px;
+            background: #101820e8;
+            border-width: 1px;
+            border-color: #ffffff38;
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                text: root.selection-info-text;
+                color: #ffffff;
+                font-size: 12px;
+                font-family: "Consolas";
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        inspector := Rectangle {
+            visible: root.inspector-visible;
+            width: 166px;
+            height: 190px;
+            x: root.inspector-x * 1px + 20px + self.width <= parent.width - 8px
+                ? root.inspector-x * 1px + 20px
+                : max(8px, root.inspector-x * 1px - self.width - 20px);
+            y: root.inspector-y * 1px + 20px + self.height <= parent.height - 8px
+                ? root.inspector-y * 1px + 20px
+                : max(8px, root.inspector-y * 1px - self.height - 20px);
+            border-radius: 7px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #cbd5e1;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000033;
+
+            Rectangle {
+                x: 8px;
+                y: 8px;
+                width: 150px;
+                height: 150px;
+                clip: true;
+                background: #111827;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.inspector-image;
+                    image-fit: fill;
+                    image-rendering: pixelated;
+                }
+                for line in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] : Rectangle {
+                    x: line * 10px;
+                    width: 1px;
+                    height: parent.height;
+                    background: #ffffff26;
+                }
+                for line in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] : Rectangle {
+                    y: line * 10px;
+                    width: parent.width;
+                    height: 1px;
+                    background: #ffffff26;
+                }
+                Rectangle {
+                    x: 70px;
+                    y: 70px;
+                    width: 10px;
+                    height: 10px;
+                    background: transparent;
+                    border-width: 2px;
+                    border-color: #ffffff;
+                }
+                Rectangle {
+                    x: 71px;
+                    y: 71px;
+                    width: 8px;
+                    height: 8px;
+                    background: transparent;
+                    border-width: 1px;
+                    border-color: #111827;
+                }
+            }
+
+            Rectangle {
+                x: 10px;
+                y: 165px;
+                width: 14px;
+                height: 14px;
+                border-radius: 3px;
+                background: root.inspector-color;
+                border-width: 1px;
+                border-color: #94a3b8;
+            }
+            Text {
+                x: 30px;
+                y: 161px;
+                width: 128px;
+                height: 16px;
+                text: root.inspector-color-text;
+                color: #0f172a;
+                font-size: 12px;
+                font-family: "Consolas";
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Text {
+                x: 30px;
+                y: 175px;
+                width: 128px;
+                height: 13px;
+                text: root.inspector-position-text;
+                color: #64748b;
+                font-size: 10px;
+                font-family: "Consolas";
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        Rectangle {
             visible: root.toolbar-visible;
             x: root.toolbar-x * 1px;
             y: root.toolbar-y * 1px;
-            width: 408px;
+            width: 428px;
             height: 56px;
             border-radius: 12px;
             background: #ffffff;
@@ -314,10 +600,8 @@ export component CaptureWindow inherits Window {
                     tooltip-text: "复制截图";
                     activated => { root.run-action("copy"); }
                 }
-                ToolbarButton {
-                    icon-kind: "save";
-                    tooltip-text: "保存截图";
-                    activated => { root.run-action("save"); }
+                SaveSplitButton {
+                    run-action(action) => { root.run-action(action); }
                 }
                 ToolbarButton {
                     icon-kind: "pin";
@@ -342,7 +626,7 @@ export component CaptureWindow inherits Window {
             width: min(max(toast-text.preferred-width + 32px, 128px), 440px);
             height: 36px;
             x: root.toolbar-visible
-                ? max(12px, min(parent.width - self.width - 12px, root.toolbar-x * 1px + 204px - self.width / 2))
+                ? max(12px, min(parent.width - self.width - 12px, root.toolbar-x * 1px + 214px - self.width / 2))
                 : (parent.width - self.width) / 2;
             y: root.toolbar-visible
                 ? (root.toolbar-y * 1px >= 52px
@@ -382,14 +666,105 @@ export component CaptureWindow inherits Window {
 
 export component PinWindow inherits Window {
     in property <image> pin-image;
-    callback close-requested();
+    in-out property <bool> pin-always-on-top: true;
+    in property <string> status;
+    in property <int> status-revision;
+    private property <bool> status-visible;
+    callback run-action(string);
+    callback pointer-down(float, float);
+    callback pointer-move(float, float);
+    callback pointer-up();
+    callback zoom(float, float, float);
     no-frame: true;
-    always-on-top: true;
+    always-on-top: root.pin-always-on-top;
     background: #0b1015;
+
+    changed status-revision => {
+        if (root.status != "") {
+            root.status-visible = true;
+            pin-status-timer.restart();
+        }
+    }
+
+    pin-status-timer := Timer {
+        interval: 2400ms;
+        running: false;
+        triggered() => {
+            root.status-visible = false;
+            self.stop();
+        }
+    }
+
     Rectangle {
         background: #0b1015;
         Image { source: root.pin-image; width: parent.width; height: parent.height; image-fit: contain; }
-        TouchArea { clicked => { root.close-requested(); } }
+        ContextMenuArea {
+            Menu {
+                MenuItem {
+                    title: root.pin-always-on-top ? "取消置顶" : "置顶";
+                    checked: root.pin-always-on-top;
+                    activated => { root.pin-always-on-top = !root.pin-always-on-top; }
+                }
+                MenuSeparator { }
+                MenuItem {
+                    title: "复制";
+                    activated => { root.run-action("copy"); }
+                }
+                MenuItem {
+                    title: "另存为...";
+                    activated => { root.run-action("save-as"); }
+                }
+                MenuSeparator { }
+                MenuItem {
+                    title: "关闭";
+                    activated => { root.run-action("close"); }
+                }
+            }
+
+            pin-drag := TouchArea {
+                mouse-cursor: self.pressed ? grabbing : grab;
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                        root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px);
+                    }
+                    if (event.kind == PointerEventKind.move && self.pressed) {
+                        root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px);
+                    }
+                    if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                        root.pointer-up();
+                    }
+                }
+                scroll-event(event) => {
+                    if (event.modifiers.control && event.delta-y != 0px) {
+                        root.zoom(event.delta-y / 1px, self.mouse-x / 1px, self.mouse-y / 1px);
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+        }
+
+        Rectangle {
+            visible: root.status-visible;
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height - 10px;
+            width: min(max(pin-status.preferred-width + 24px, 120px), parent.width - 16px);
+            height: 32px;
+            border-radius: 7px;
+            background: #fffffff2;
+            border-width: 1px;
+            border-color: #d5dce5;
+            pin-status := Text {
+                x: 12px;
+                width: parent.width - 24px;
+                height: parent.height;
+                text: root.status;
+                color: #334155;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
     }
 }
 
@@ -667,13 +1042,13 @@ export component SettingsWindow inherits Window {
             }
             Text {
                 y: 58px;
-                text: "选择截图文件的默认保存位置";
+                text: "设置直接保存时使用的固定目录";
                 color: #64748b;
                 font-size: 13px;
             }
             Text {
                 y: 99px;
-                text: "保存目录";
+                text: "默认保存位置";
                 color: #475569;
                 font-size: 13px;
                 font-weight: 500;

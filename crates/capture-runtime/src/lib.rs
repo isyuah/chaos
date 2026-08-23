@@ -24,12 +24,16 @@ pub enum CopyDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePolicy {
     pub copy_disposition: CopyDisposition,
+    pub close_after_save: bool,
+    pub close_after_pin: bool,
 }
 
 impl Default for RuntimePolicy {
     fn default() -> Self {
         Self {
             copy_disposition: CopyDisposition::KeepEditorOpen,
+            close_after_save: true,
+            close_after_pin: true,
         }
     }
 }
@@ -369,10 +373,13 @@ impl CaptureRuntime {
             format!("{action} failed")
         };
         let mut events = vec![RuntimeEvent::StatusChanged(message.unwrap_or(fallback))];
-        if success
-            && action == ActionId::COPY
-            && self.policy.copy_disposition == CopyDisposition::CloseOverlay
-        {
+        let close_overlay = match action {
+            ActionId::COPY => self.policy.copy_disposition == CopyDisposition::CloseOverlay,
+            ActionId::SAVE => self.policy.close_after_save,
+            ActionId::PIN => self.policy.close_after_pin,
+            _ => false,
+        };
+        if success && close_overlay {
             events.push(RuntimeEvent::CloseOverlay);
         }
         events
@@ -603,6 +610,7 @@ mod tests {
     fn successful_copy_closes_only_for_a_matching_request() {
         let mut runtime = editing_runtime(RuntimePolicy {
             copy_disposition: CopyDisposition::CloseOverlay,
+            ..RuntimePolicy::default()
         });
         let request_id = request_action(&mut runtime, ActionId::COPY);
         let events = runtime.dispatch(RuntimeCommand::CompleteAction {
@@ -613,6 +621,31 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, RuntimeEvent::CloseOverlay)));
+    }
+
+    #[test]
+    fn successful_save_and_pin_close_by_default_but_failures_do_not() {
+        for action in [ActionId::SAVE, ActionId::PIN] {
+            let mut runtime = editing_runtime(RuntimePolicy::default());
+            let request_id = request_action(&mut runtime, action);
+            let succeeded = runtime.dispatch(RuntimeCommand::CompleteAction {
+                request_id,
+                completion: ActionCompletion::Succeeded { message: None },
+            });
+            assert!(succeeded
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::CloseOverlay)));
+
+            let mut runtime = editing_runtime(RuntimePolicy::default());
+            let request_id = request_action(&mut runtime, action);
+            let failed = runtime.dispatch(RuntimeCommand::CompleteAction {
+                request_id,
+                completion: ActionCompletion::Failed { message: None },
+            });
+            assert!(!failed
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::CloseOverlay)));
+        }
     }
 
     #[test]

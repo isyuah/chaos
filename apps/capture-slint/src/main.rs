@@ -16,7 +16,7 @@ use capture_core::{
     ToolbarPlacementReason,
 };
 use capture_platform_api::{CaptureBackend, SnapBackend};
-use capture_render::flatten;
+use capture_render::{flatten, save_png, RenderedImage};
 use capture_runtime::{
     ActionCompletion, ActionRequestId, CaptureRuntime, CaptureSessionId, RuntimeCommand,
     RuntimeError, RuntimeEvent,
@@ -25,12 +25,13 @@ use desktop::{DesktopCommand, DesktopIntegration, ShortcutApply};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use settings::{AppSettings, SettingsStore, Shortcut, ShortcutParseError};
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
-use std::cell::RefCell;
+use slint::{Color, Image, Rgba8Pixel, SharedPixelBuffer};
+use std::cell::{Cell, RefCell};
 use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -173,6 +174,20 @@ struct EditorLayout {
     toolbar_reason: ToolbarPlacementReason,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InspectorColorFormat {
+    #[default]
+    Hex,
+    Rgb,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InspectorCoordinateMode {
+    #[default]
+    Relative,
+    Absolute,
+}
+
 impl HostPlatform {
     fn capture(&self) -> &dyn CaptureBackend {
         match self {
@@ -202,7 +217,6 @@ struct Controller {
     scale_factor: f64,
     status: String,
     status_revision: i32,
-    pin_window: Option<PinWindow>,
     last_snap_at: Option<Instant>,
     last_visual_at: Option<Instant>,
     pointer_moves: u64,
@@ -214,6 +228,15 @@ struct Controller {
     toolbar_drag_offset: Option<PhysicalPoint>,
     overlay_token: Option<SnapExclusionToken>,
     last_toolbar_log_at: std::cell::Cell<Option<Instant>>,
+    inspector_color_format: InspectorColorFormat,
+    inspector_coordinate_mode: InspectorCoordinateMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveMode {
+    Default,
+    DefaultAndReveal,
+    SaveAs,
 }
 
 fn make_host() -> Result<HostPlatform, String> {
@@ -274,7 +297,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scale_factor: 1.0,
         status: String::new(),
         status_revision: 0,
-        pin_window: None,
         last_snap_at: None,
         last_visual_at: None,
         pointer_moves: 0,
@@ -286,6 +308,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         toolbar_drag_offset: None,
         overlay_token: None,
         last_toolbar_log_at: std::cell::Cell::new(None),
+        inspector_color_format: InspectorColorFormat::default(),
+        inspector_coordinate_mode: InspectorCoordinateMode::default(),
     }));
     ui.set_canvas_cursor_kind("default".into());
     ui.set_toolbar_cursor_kind("grab".into());
@@ -488,9 +512,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             controller.last_pointer = Some(point);
             controller.pointer_gesture = None;
-            controller.last_pointer = None;
             refresh_pointer_visuals(&ui, &controller);
             controller.log.duration("input.up.total", started);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_inspector_key_pressed(move |key, ctrl, alt, _shift, meta, repeat| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return false;
+            };
+            if ctrl || alt || meta {
+                return false;
+            }
+
+            let mut controller = state.borrow_mut();
+            let key = key.as_str();
+            let shift_pressed = [slint::platform::Key::Shift, slint::platform::Key::ShiftR]
+                .into_iter()
+                .any(|candidate| key == char::from(candidate).to_string());
+            if shift_pressed {
+                if !repeat {
+                    controller.inspector_color_format = match controller.inspector_color_format {
+                        InspectorColorFormat::Hex => InspectorColorFormat::Rgb,
+                        InspectorColorFormat::Rgb => InspectorColorFormat::Hex,
+                    };
+                    refresh_pixel_inspector(&ui, &controller);
+                }
+                return true;
+            }
+            if key.eq_ignore_ascii_case("p") {
+                if !repeat {
+                    controller.inspector_coordinate_mode =
+                        match controller.inspector_coordinate_mode {
+                            InspectorCoordinateMode::Relative => InspectorCoordinateMode::Absolute,
+                            InspectorCoordinateMode::Absolute => InspectorCoordinateMode::Relative,
+                        };
+                    refresh_pixel_inspector(&ui, &controller);
+                }
+                return true;
+            }
+            if key.eq_ignore_ascii_case("c") {
+                if !repeat {
+                    match current_pixel_color_text(&controller) {
+                        Some(color) => match copy_text_to_clipboard(&color) {
+                            Ok(()) => controller.set_status(format!("已复制颜色 {color}")),
+                            Err(error) => controller.set_status(format!("复制颜色失败：{error}")),
+                        },
+                        None => return false,
+                    }
+                    refresh_selection_geometry(&ui, &controller);
+                }
+                return true;
+            }
+            false
         });
     }
 
@@ -1094,6 +1171,58 @@ fn next_capture_path(directory: &std::path::Path) -> Result<PathBuf, String> {
     Err("无法生成不重复的截图文件名".to_string())
 }
 
+fn choose_save_path(
+    directory: &std::path::Path,
+    parent: &slint::Window,
+) -> Result<Option<PathBuf>, String> {
+    let suggested = next_capture_path(directory)?;
+    let file_name = suggested
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("无法生成有效的截图文件名：{}", suggested.display()))?;
+    let parent_handle = parent.window_handle();
+    Ok(rfd::FileDialog::new()
+        .set_title("另存截图为")
+        .set_parent(&parent_handle)
+        .set_directory(directory)
+        .set_file_name(file_name)
+        .add_filter("PNG 图片", &["png"])
+        .save_file()
+        .map(ensure_png_extension))
+}
+
+fn ensure_png_extension(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+    {
+        path.set_extension("png");
+    }
+    path
+}
+
+#[cfg(windows)]
+fn reveal_saved_file(path: &std::path::Path) -> Result<(), String> {
+    ProcessCommand::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_saved_file(path: &std::path::Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("保存路径没有父目录：{}", path.display()))?;
+    ProcessCommand::new("xdg-open")
+        .arg(directory)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn request_capture(
     ui: &CaptureWindow,
     state: &Rc<RefCell<Controller>>,
@@ -1111,6 +1240,8 @@ fn request_capture(
         controller.toolbar_drag_offset = None;
         controller.last_snap_at = None;
         controller.last_visual_at = None;
+        controller.inspector_color_format = InspectorColorFormat::default();
+        controller.inspector_coordinate_mode = InspectorCoordinateMode::default();
         controller.set_status("正在截图…");
         let events = controller.dispatch_runtime(RuntimeCommand::BeginCapture);
         let Some(session_id) = events.into_iter().find_map(|event| match event {
@@ -1577,10 +1708,16 @@ impl Controller {
                 ui.set_frame_image(image_from_frame(&self.frame));
                 return;
             }
-            "copy" | "save" | "pin" | "ask-ai" => {
+            "copy" | "save" | "save-open" | "save-as" | "pin" | "ask-ai" => {
+                let save_mode = match action {
+                    "save" => Some(SaveMode::Default),
+                    "save-open" => Some(SaveMode::DefaultAndReveal),
+                    "save-as" => Some(SaveMode::SaveAs),
+                    _ => None,
+                };
                 let action_id = match action {
                     "copy" => ActionId::COPY,
-                    "save" => ActionId::SAVE,
+                    "save" | "save-open" | "save-as" => ActionId::SAVE,
                     "pin" => ActionId::PIN,
                     "ask-ai" => ActionId::ASK_AI,
                     _ => unreachable!(),
@@ -1590,7 +1727,7 @@ impl Controller {
                 ));
                 for event in events {
                     if let RuntimeEvent::ActionRequested { request_id, action } = event {
-                        self.execute_builtin_action(request_id, action, ui);
+                        self.execute_builtin_action(request_id, action, save_mode, ui);
                     }
                 }
             }
@@ -1607,6 +1744,7 @@ impl Controller {
         &mut self,
         request_id: ActionRequestId,
         action: ActionId,
+        save_mode: Option<SaveMode>,
         ui: &CaptureWindow,
     ) {
         let Some(document) = self.document() else {
@@ -1626,20 +1764,56 @@ impl Controller {
                 }
             },
             ActionId::SAVE => {
-                let path = match next_capture_path(&self.config.settings.save_directory) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.complete_action(request_id, false, format!("保存失败：{error}"), ui);
-                        return;
+                let save_mode = save_mode.unwrap_or(SaveMode::Default);
+                let path = match save_mode {
+                    SaveMode::Default | SaveMode::DefaultAndReveal => {
+                        match next_capture_path(&self.config.settings.save_directory) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                self.complete_action(
+                                    request_id,
+                                    false,
+                                    format!("保存失败：{error}"),
+                                    ui,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    SaveMode::SaveAs => {
+                        match choose_save_path(&self.config.settings.save_directory, ui.window()) {
+                            Ok(Some(path)) => path,
+                            Ok(None) => {
+                                self.complete_action(request_id, false, "已取消另存为", ui);
+                                return;
+                            }
+                            Err(error) => {
+                                self.complete_action(
+                                    request_id,
+                                    false,
+                                    format!("无法打开另存为对话框：{error}"),
+                                    ui,
+                                );
+                                return;
+                            }
+                        }
                     }
                 };
                 match SaveAction::new(&path).invoke(&document) {
-                    Ok(ActionOutcome::Saved(path)) => self.complete_action(
-                        request_id,
-                        true,
-                        format!("已保存到 {}", path.display()),
-                        ui,
-                    ),
+                    Ok(ActionOutcome::Saved(path)) => {
+                        let message = if save_mode == SaveMode::DefaultAndReveal {
+                            match reveal_saved_file(&path) {
+                                Ok(()) => format!("已保存到 {}", path.display()),
+                                Err(error) => format!(
+                                    "已保存到 {}，但无法打开所在位置：{error}",
+                                    path.display()
+                                ),
+                            }
+                        } else {
+                            format!("已保存到 {}", path.display())
+                        };
+                        self.complete_action(request_id, true, message, ui);
+                    }
                     Ok(_) => self.complete_action(request_id, true, "保存完成", ui),
                     Err(error) => {
                         self.complete_action(request_id, false, format!("保存失败：{error}"), ui)
@@ -1661,6 +1835,7 @@ impl Controller {
                                 return;
                             }
                         };
+                        let rendered = Arc::new(rendered);
                         let image =
                             image_from_rgba(rendered.width, rendered.height, &rendered.pixels);
                         pin.set_pin_image(image);
@@ -1670,14 +1845,12 @@ impl Controller {
                             document.crop.origin.x.saturating_add(16),
                             document.crop.origin.y.saturating_add(16),
                         ));
-                        let pin_weak = pin.as_weak();
-                        pin.on_close_requested(move || {
-                            if let Some(pin) = pin_weak.upgrade() {
-                                let _ = pin.hide();
-                            }
-                        });
+                        configure_pin_window(
+                            &pin,
+                            rendered,
+                            self.config.settings.save_directory.clone(),
+                        );
                         let _ = pin.show();
-                        self.pin_window = Some(pin);
                         self.complete_action(request_id, true, "截图已固定为浮动窗口", ui);
                     }
                     Err(error) => self.complete_action(
@@ -1762,6 +1935,7 @@ fn refresh_ui(ui: &CaptureWindow, controller: &Controller) {
     }
     refresh_selection_geometry(ui, controller);
     refresh_editor_overlay(ui, controller);
+    refresh_pixel_inspector(ui, controller);
     controller.log.event(
         "render.refresh_ui",
         format!(
@@ -1781,6 +1955,7 @@ fn refresh_pointer_visuals(ui: &CaptureWindow, controller: &Controller) {
         }
         CaptureSessionState::Idle | CaptureSessionState::Preparing => refresh_ui(ui, controller),
     }
+    refresh_pixel_inspector(ui, controller);
 }
 
 fn refresh_editor_ui(ui: &CaptureWindow, controller: &Controller, refresh_base: bool) {
@@ -1797,6 +1972,7 @@ fn refresh_editor_ui(ui: &CaptureWindow, controller: &Controller, refresh_base: 
     }
     refresh_selection_geometry(ui, controller);
     refresh_editor_overlay(ui, controller);
+    refresh_pixel_inspector(ui, controller);
     controller.log.event(
         "render.editor_ui",
         format!(
@@ -1877,6 +2053,11 @@ fn refresh_selection_geometry(ui: &CaptureWindow, controller: &Controller) {
     ui.set_selection_y((rect.origin.y - window_origin.y) as f32 / scale);
     ui.set_selection_width(rect.size.width as f32 / scale);
     ui.set_selection_height(rect.size.height as f32 / scale);
+    ui.set_selection_info_text(format_selection_info(rect).into());
+    let selection_info_position = place_selection_info(rect, controller.frame.bounds(), scale);
+    ui.set_selection_info_x((selection_info_position.x - window_origin.x) as f32 / scale);
+    ui.set_selection_info_y((selection_info_position.y - window_origin.y) as f32 / scale);
+    ui.set_selection_info_visible(!rect.is_empty());
     ui.set_selecting(!editing);
     ui.set_editing(editing);
     ui.set_active_tool(tool.into());
@@ -1912,6 +2093,156 @@ fn refresh_selection_geometry(ui: &CaptureWindow, controller: &Controller) {
     }
     ui.set_status(controller.status.clone().into());
     ui.set_status_revision(controller.status_revision);
+}
+
+fn format_selection_info(rect: PhysicalRect) -> String {
+    format!(
+        "({}, {})  {} × {}",
+        rect.origin.x,
+        rect.origin.y,
+        rect.width(),
+        rect.height()
+    )
+}
+
+fn place_selection_info(
+    selection: PhysicalRect,
+    frame_bounds: PhysicalRect,
+    scale: f32,
+) -> PhysicalPoint {
+    let margin = (8.0 * scale).round().max(1.0) as i32;
+    let info_width = (230.0 * scale).round().max(1.0) as u32;
+    let info_height = (30.0 * scale).round().max(1.0) as u32;
+    let above_y = selection
+        .origin
+        .y
+        .saturating_sub(info_height as i32)
+        .saturating_sub(margin);
+    let above = PhysicalRect::new(
+        PhysicalPoint::new(selection.origin.x, above_y),
+        PhysicalSize::new(info_width, info_height),
+    )
+    .clamp(PhysicalRect::new(
+        PhysicalPoint::new(frame_bounds.left(), above_y),
+        PhysicalSize::new(frame_bounds.width(), info_height),
+    ));
+    if above.top() >= frame_bounds.top() {
+        return above.origin;
+    }
+
+    let below_y = selection.bottom().saturating_add(margin);
+    let below = PhysicalRect::new(
+        PhysicalPoint::new(selection.origin.x, below_y),
+        PhysicalSize::new(info_width, info_height),
+    )
+    .clamp(PhysicalRect::new(
+        PhysicalPoint::new(frame_bounds.left(), below_y),
+        PhysicalSize::new(frame_bounds.width(), info_height),
+    ));
+    if below.bottom() <= frame_bounds.bottom() {
+        return below.origin;
+    }
+
+    let inside = PhysicalRect::new(
+        PhysicalPoint::new(
+            selection.origin.x.saturating_add(margin),
+            selection.origin.y.saturating_add(margin),
+        ),
+        PhysicalSize::new(info_width, info_height),
+    );
+    inside.clamp(frame_bounds).origin
+}
+
+fn refresh_pixel_inspector(ui: &CaptureWindow, controller: &Controller) {
+    let Some(point) = controller.last_pointer else {
+        ui.set_inspector_visible(false);
+        return;
+    };
+    let Some(pixel) = sample_frame_pixel(&controller.frame, point) else {
+        ui.set_inspector_visible(false);
+        return;
+    };
+    let Some(magnified) = magnifier_image(&controller.frame, point, 15) else {
+        ui.set_inspector_visible(false);
+        return;
+    };
+    let scale = controller.scale_factor as f32;
+    let local_x = (point.x - controller.frame.origin.x) as f32 / scale;
+    let local_y = (point.y - controller.frame.origin.y) as f32 / scale;
+    let coordinate = match controller.inspector_coordinate_mode {
+        InspectorCoordinateMode::Relative => {
+            let origin = current_selection_rect(controller)
+                .map(|selection| selection.origin)
+                .unwrap_or(controller.frame.origin);
+            format!("相对 {}, {}", point.x - origin.x, point.y - origin.y)
+        }
+        InspectorCoordinateMode::Absolute => format!("绝对 {}, {}", point.x, point.y),
+    };
+    let color = format_pixel_color(pixel, controller.inspector_color_format);
+
+    ui.set_inspector_x(local_x);
+    ui.set_inspector_y(local_y);
+    ui.set_inspector_image(magnified);
+    ui.set_inspector_color(Color::from_argb_u8(pixel[3], pixel[0], pixel[1], pixel[2]));
+    ui.set_inspector_color_text(color.into());
+    ui.set_inspector_position_text(coordinate.into());
+    ui.set_inspector_visible(true);
+}
+
+fn current_selection_rect(controller: &Controller) -> Option<PhysicalRect> {
+    match controller.runtime.state() {
+        CaptureSessionState::Selecting(selection) => {
+            (!selection.rect.is_empty()).then_some(selection.rect)
+        }
+        CaptureSessionState::Editing(editor) => Some(editor.document.crop),
+        CaptureSessionState::Idle | CaptureSessionState::Preparing => None,
+    }
+}
+
+fn sample_frame_pixel(frame: &CapturedFrame, point: PhysicalPoint) -> Option<[u8; 4]> {
+    if frame.pixel_format != PixelFormat::Rgba8 || !frame.bounds().contains_exclusive(point) {
+        return None;
+    }
+    let x = usize::try_from(point.x as i64 - frame.origin.x as i64).ok()?;
+    let y = usize::try_from(point.y as i64 - frame.origin.y as i64).ok()?;
+    let index = y
+        .checked_mul(frame.stride as usize)?
+        .checked_add(x.checked_mul(4)?)?;
+    let pixel = frame.pixels.get(index..index.checked_add(4)?)?;
+    Some([pixel[0], pixel[1], pixel[2], pixel[3]])
+}
+
+fn magnifier_image(frame: &CapturedFrame, center: PhysicalPoint, size: u32) -> Option<Image> {
+    if size == 0 || size.is_multiple_of(2) {
+        return None;
+    }
+    let mut pixels = vec![0_u8; size.checked_mul(size)?.checked_mul(4)? as usize];
+    let radius = (size / 2) as i32;
+    let bounds = frame.bounds();
+    for y in 0..size {
+        for x in 0..size {
+            let sample = bounds.clamp_point(PhysicalPoint::new(
+                center.x.saturating_add(x as i32 - radius),
+                center.y.saturating_add(y as i32 - radius),
+            ));
+            let rgba = sample_frame_pixel(frame, sample)?;
+            let index = ((y * size + x) * 4) as usize;
+            pixels[index..index + 4].copy_from_slice(&rgba);
+        }
+    }
+    Some(image_from_rgba(size, size, &pixels))
+}
+
+fn format_pixel_color(pixel: [u8; 4], format: InspectorColorFormat) -> String {
+    match format {
+        InspectorColorFormat::Hex => format!("#{:02X}{:02X}{:02X}", pixel[0], pixel[1], pixel[2]),
+        InspectorColorFormat::Rgb => format!("RGB({}, {}, {})", pixel[0], pixel[1], pixel[2]),
+    }
+}
+
+fn current_pixel_color_text(controller: &Controller) -> Option<String> {
+    let pixel = sample_frame_pixel(&controller.frame, controller.last_pointer?)?;
+    Some(format_pixel_color(pixel, controller.inspector_color_format))
 }
 
 fn annotation_path(
@@ -1988,7 +2319,7 @@ fn editor_layout(controller: &Controller) -> Option<EditorLayout> {
         })
         .unwrap_or(frame_bounds);
     let toolbar_size = PhysicalSize::new(
-        (408.0 * controller.scale_factor).round().max(1.0) as u32,
+        (428.0 * controller.scale_factor).round().max(1.0) as u32,
         (56.0 * controller.scale_factor).round().max(1.0) as u32,
     );
     let placement = place_toolbar(selection, toolbar_size, work_area, 12);
@@ -2061,14 +2392,163 @@ fn copy_document_to_clipboard(
     document: &capture_annotation::CaptureDocument,
 ) -> Result<(), String> {
     let rendered = flatten(document).map_err(|error| error.to_string())?;
+    copy_rendered_to_clipboard(&rendered)
+}
+
+fn copy_rendered_to_clipboard(rendered: &RenderedImage) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
     clipboard
         .set_image(ImageData {
             width: rendered.width as usize,
             height: rendered.height as usize,
-            bytes: std::borrow::Cow::Owned(rendered.pixels),
+            bytes: std::borrow::Cow::Owned(rendered.pixels.clone()),
         })
         .map_err(|error| error.to_string())
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| error.to_string())
+}
+
+fn configure_pin_window(pin: &PinWindow, rendered: Arc<RenderedImage>, save_directory: PathBuf) {
+    {
+        let pin_weak = pin.as_weak();
+        let rendered = rendered.clone();
+        pin.on_run_action(move |action| {
+            let Some(pin) = pin_weak.upgrade() else {
+                return;
+            };
+            match action.as_str() {
+                "copy" => match copy_rendered_to_clipboard(&rendered) {
+                    Ok(()) => set_pin_status(&pin, "已复制到剪贴板"),
+                    Err(error) => set_pin_status(&pin, format!("复制失败：{error}")),
+                },
+                "save-as" => match choose_save_path(&save_directory, pin.window()) {
+                    Ok(Some(path)) => match save_png(&path, &rendered) {
+                        Ok(()) => set_pin_status(&pin, format!("已保存到 {}", path.display())),
+                        Err(error) => set_pin_status(&pin, format!("保存失败：{error}")),
+                    },
+                    Ok(None) => {}
+                    Err(error) => set_pin_status(&pin, format!("无法打开另存为对话框：{error}")),
+                },
+                "close" => {
+                    let _ = pin.hide();
+                }
+                _ => {}
+            }
+        });
+    }
+
+    let zoom_factor = Rc::new(Cell::new(1.0_f32));
+    {
+        let pin_weak = pin.as_weak();
+        let zoom_factor = zoom_factor.clone();
+        let base_size = PhysicalSize::new(rendered.width, rendered.height);
+        pin.on_zoom(move |delta, pointer_x, pointer_y| {
+            let Some(pin) = pin_weak.upgrade() else {
+                return;
+            };
+            let previous_zoom = zoom_factor.get();
+            let next_zoom = next_pin_zoom(previous_zoom, delta, base_size);
+            let previous_size = pin.window().size();
+            let next_size = pin_size_for_zoom(base_size, next_zoom);
+            if previous_size == next_size {
+                return;
+            }
+
+            let window_scale = pin.window().scale_factor().max(0.1);
+            let anchor_x = (pointer_x * window_scale).clamp(0.0, previous_size.width as f32);
+            let anchor_y = (pointer_y * window_scale).clamp(0.0, previous_size.height as f32);
+            let next_anchor_x =
+                anchor_x * next_size.width as f32 / previous_size.width.max(1) as f32;
+            let next_anchor_y =
+                anchor_y * next_size.height as f32 / previous_size.height.max(1) as f32;
+            let position = pin.window().position();
+            let next_position = slint::PhysicalPosition::new(
+                position
+                    .x
+                    .saturating_add((anchor_x - next_anchor_x).round() as i32),
+                position
+                    .y
+                    .saturating_add((anchor_y - next_anchor_y).round() as i32),
+            );
+
+            pin.window().set_size(next_size);
+            pin.window().set_position(next_position);
+            zoom_factor.set(next_zoom);
+        });
+    }
+
+    let drag_anchor = Rc::new(RefCell::new(None::<(f32, f32)>));
+    {
+        let pin_weak = pin.as_weak();
+        let drag_anchor = drag_anchor.clone();
+        pin.on_pointer_down(move |x, y| {
+            if pin_weak.upgrade().is_some() {
+                *drag_anchor.borrow_mut() = Some((x, y));
+            }
+        });
+    }
+    {
+        let pin_weak = pin.as_weak();
+        let drag_anchor = drag_anchor.clone();
+        pin.on_pointer_move(move |x, y| {
+            let Some((anchor_x, anchor_y)) = *drag_anchor.borrow() else {
+                return;
+            };
+            let Some(pin) = pin_weak.upgrade() else {
+                return;
+            };
+            let scale = pin.window().scale_factor();
+            let delta_x = ((x - anchor_x) * scale).round() as i32;
+            let delta_y = ((y - anchor_y) * scale).round() as i32;
+            if delta_x == 0 && delta_y == 0 {
+                return;
+            }
+            let position = pin.window().position();
+            pin.window().set_position(slint::PhysicalPosition::new(
+                position.x.saturating_add(delta_x),
+                position.y.saturating_add(delta_y),
+            ));
+        });
+    }
+    pin.on_pointer_up(move || {
+        *drag_anchor.borrow_mut() = None;
+    });
+}
+
+fn next_pin_zoom(current: f32, delta: f32, base_size: PhysicalSize) -> f32 {
+    const STEP: f32 = 1.1;
+    const MIN_ZOOM: f32 = 0.25;
+    const MAX_ZOOM: f32 = 8.0;
+    const MAX_PIN_EDGE: f32 = 16_384.0;
+
+    let size_limit = (MAX_PIN_EDGE / base_size.width.max(1) as f32)
+        .min(MAX_PIN_EDGE / base_size.height.max(1) as f32)
+        .clamp(MIN_ZOOM, MAX_ZOOM);
+    let candidate = if delta > 0.0 {
+        current * STEP
+    } else {
+        current / STEP
+    };
+    candidate.clamp(MIN_ZOOM, size_limit)
+}
+
+fn pin_size_for_zoom(base_size: PhysicalSize, zoom: f32) -> slint::PhysicalSize {
+    slint::PhysicalSize::new(
+        (base_size.width as f32 * zoom).round().clamp(1.0, 16_384.0) as u32,
+        (base_size.height as f32 * zoom)
+            .round()
+            .clamp(1.0, 16_384.0) as u32,
+    )
+}
+
+fn set_pin_status(pin: &PinWindow, message: impl Into<slint::SharedString>) {
+    pin.set_status(message.into());
+    pin.set_status_revision(pin.get_status_revision().wrapping_add(1));
 }
 
 #[cfg(test)]
@@ -2148,5 +2628,58 @@ mod tests {
         assert_eq!(letter.to_string(), "Ctrl+Shift+S");
         assert_eq!(function.to_string(), "Alt+F12");
         assert_eq!(print_screen.to_string(), "PrintScreen");
+    }
+
+    #[test]
+    fn pixel_sampling_respects_virtual_origin_and_row_stride() {
+        let frame = CapturedFrame::new(
+            Arc::<[u8]>::from([
+                1, 2, 3, 255, 4, 5, 6, 255, 90, 91, 92, 93, 7, 8, 9, 255, 10, 11, 12, 255, 94, 95,
+                96, 97,
+            ]),
+            2,
+            2,
+            12,
+            PhysicalPoint::new(-4, 7),
+            PixelFormat::Rgba8,
+        );
+
+        assert_eq!(
+            sample_frame_pixel(&frame, PhysicalPoint::new(-3, 8)),
+            Some([10, 11, 12, 255])
+        );
+        assert_eq!(sample_frame_pixel(&frame, PhysicalPoint::new(-2, 8)), None);
+    }
+
+    #[test]
+    fn pin_zoom_preserves_aspect_ratio_and_caps_large_images() {
+        let base = PhysicalSize::new(4_000, 2_000);
+        let zoomed = next_pin_zoom(1.0, 120.0, base);
+        let size = pin_size_for_zoom(base, zoomed);
+
+        assert!(zoomed > 1.0);
+        assert_eq!(size.width, size.height * 2);
+
+        let capped = next_pin_zoom(8.0, 120.0, PhysicalSize::new(8_000, 4_000));
+        let capped_size = pin_size_for_zoom(PhysicalSize::new(8_000, 4_000), capped);
+        assert!(capped_size.width <= 16_384);
+        assert!(capped_size.height <= 16_384);
+    }
+
+    #[test]
+    fn selection_info_prefers_outside_and_avoids_screen_edges() {
+        let frame = PhysicalRect::new(PhysicalPoint::ZERO, PhysicalSize::new(1_000, 800));
+        let near_right = PhysicalRect::new(PhysicalPoint::new(950, 100), PhysicalSize::new(40, 40));
+        let fills_height =
+            PhysicalRect::new(PhysicalPoint::new(20, 0), PhysicalSize::new(300, 800));
+
+        assert_eq!(
+            place_selection_info(near_right, frame, 1.0),
+            PhysicalPoint::new(770, 62)
+        );
+        assert_eq!(
+            place_selection_info(fills_height, frame, 1.0),
+            PhysicalPoint::new(28, 8)
+        );
     }
 }

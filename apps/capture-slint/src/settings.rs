@@ -36,6 +36,8 @@ impl AppSettings {
     pub fn runtime_policy(&self) -> RuntimePolicy {
         RuntimePolicy {
             copy_disposition: self.copy_disposition,
+            close_after_save: true,
+            close_after_pin: true,
         }
     }
 }
