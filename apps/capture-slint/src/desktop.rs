@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 #[derive(Debug, Clone)]
 pub enum DesktopCommand {
     Capture,
+    ShortcutCapture,
     Settings,
     Quit,
     #[cfg(target_os = "linux")]
@@ -92,7 +93,7 @@ fn install_native_hotkey_handler(
 
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.id == active_id.load(Ordering::Acquire) && event.state == HotKeyState::Pressed {
-            let _ = sender.send(DesktopCommand::Capture);
+            let _ = sender.send(DesktopCommand::ShortcutCapture);
         }
     }));
 }
@@ -480,7 +481,7 @@ async fn run_wayland_shortcut(
             Either::Left((Some(event), _)) => {
                 if event.shortcut_id() == "capture"
                     && !cancelled.load(Ordering::Acquire)
-                    && sender.send(DesktopCommand::Capture).is_err()
+                    && sender.send(DesktopCommand::ShortcutCapture).is_err()
                 {
                     break;
                 }

@@ -24,7 +24,7 @@ use capture_runtime::{
 use desktop::{DesktopCommand, DesktopIntegration, ShortcutApply};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use settings::{AppSettings, SettingsStore, Shortcut};
+use settings::{AppSettings, SettingsStore, Shortcut, ShortcutParseError};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -656,6 +656,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             request_capture(&ui, &state, capture_sender.clone())
                         }
+                        DesktopCommand::ShortcutCapture => {
+                            let settings_visible = settings_window
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|settings| settings.window().is_visible());
+                            if settings_visible {
+                                state
+                                    .borrow()
+                                    .log
+                                    .event("desktop.hotkey.ignored", "reason=settings_visible");
+                            } else {
+                                request_capture(&ui, &state, capture_sender.clone());
+                            }
+                        }
                         DesktopCommand::Settings => show_settings_window(
                             &ui,
                             &state,
@@ -725,7 +739,10 @@ fn show_settings_window(
         }
     }
 
-    if settings_window.borrow().is_none() {
+    {
+        if let Some(previous) = settings_window.borrow_mut().take() {
+            let _ = previous.hide();
+        }
         let settings = match SettingsWindow::new() {
             Ok(settings) => settings,
             Err(error) => {
@@ -760,6 +777,29 @@ fn show_settings_window(
                 if let Some(directory) = dialog.pick_folder() {
                     settings.set_save_directory(directory.to_string_lossy().into_owned().into());
                     settings.set_status("".into());
+                }
+            });
+        }
+
+        {
+            let settings_weak = settings.as_weak();
+            settings.on_record_shortcut(move |key, ctrl, alt, shift, meta| {
+                let Some(settings) = settings_weak.upgrade() else {
+                    return false;
+                };
+                match shortcut_from_key_event(key.as_str(), ctrl, alt, shift, meta) {
+                    Ok(Some(shortcut)) => {
+                        settings.set_shortcut(shortcut.to_string().into());
+                        settings.set_status("".into());
+                        settings.set_status_is_error(false);
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        settings.set_status(error.to_string().into());
+                        settings.set_status_is_error(true);
+                        false
+                    }
                 }
             });
         }
@@ -898,6 +938,70 @@ fn show_settings_window(
                 .event("settings.window.show.error", format!("error={error}"));
         }
     }
+}
+
+fn shortcut_from_key_event(
+    key_text: &str,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+) -> Result<Option<Shortcut>, ShortcutParseError> {
+    use slint::platform::Key;
+
+    let mut characters = key_text.chars();
+    let Some(key) = characters.next() else {
+        return Err(ShortcutParseError::UnsupportedKey(key_text.to_string()));
+    };
+    if characters.next().is_some() {
+        return Err(ShortcutParseError::UnsupportedKey(key_text.to_string()));
+    }
+
+    if [
+        Key::Control,
+        Key::ControlR,
+        Key::Alt,
+        Key::AltGr,
+        Key::Shift,
+        Key::ShiftR,
+        Key::Meta,
+        Key::MetaR,
+    ]
+    .into_iter()
+    .any(|modifier| char::from(modifier) == key)
+    {
+        return Ok(None);
+    }
+
+    let key_name = if key.is_ascii_alphanumeric() {
+        key.to_ascii_uppercase().to_string()
+    } else {
+        let first_function_key = char::from(Key::F1) as u32;
+        let key_code = key as u32;
+        if (first_function_key..=char::from(Key::F24) as u32).contains(&key_code) {
+            format!("F{}", key_code - first_function_key + 1)
+        } else if key == char::from(Key::SysReq) {
+            "PrintScreen".to_string()
+        } else {
+            return Err(ShortcutParseError::UnsupportedKey(key_text.to_string()));
+        }
+    };
+
+    let mut parts = Vec::with_capacity(5);
+    if ctrl {
+        parts.push("Ctrl");
+    }
+    if alt {
+        parts.push("Alt");
+    }
+    if shift {
+        parts.push("Shift");
+    }
+    if meta {
+        parts.push("Win");
+    }
+    parts.push(&key_name);
+    parts.join("+").parse().map(Some)
 }
 
 fn record_shortcut_status(
@@ -2015,5 +2119,34 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(!second.exists());
+    }
+
+    #[test]
+    fn shortcut_recorder_ignores_modifier_key_events() {
+        let control = char::from(slint::platform::Key::Control).to_string();
+
+        assert_eq!(
+            shortcut_from_key_event(&control, true, false, false, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_recorder_canonicalizes_supported_key_events() {
+        let letter = shortcut_from_key_event("s", true, false, true, false)
+            .unwrap()
+            .unwrap();
+        let function_key = char::from(slint::platform::Key::F12).to_string();
+        let function = shortcut_from_key_event(&function_key, false, true, false, false)
+            .unwrap()
+            .unwrap();
+        let print_screen = char::from(slint::platform::Key::SysReq).to_string();
+        let print_screen = shortcut_from_key_event(&print_screen, false, false, false, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(letter.to_string(), "Ctrl+Shift+S");
+        assert_eq!(function.to_string(), "Alt+F12");
+        assert_eq!(print_screen.to_string(), "PrintScreen");
     }
 }

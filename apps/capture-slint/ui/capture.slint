@@ -393,109 +393,336 @@ export component PinWindow inherits Window {
     }
 }
 
+component SettingsNavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback activated;
+
+    height: 40px;
+    border-radius: 6px;
+    background: root.selected ? #e7eef8 : nav-touch.has-hover ? #edf1f5 : transparent;
+
+    Rectangle {
+        visible: root.selected;
+        x: 0px;
+        y: 8px;
+        width: 3px;
+        height: 24px;
+        border-radius: 1.5px;
+        background: #2563eb;
+    }
+    Text {
+        x: 16px;
+        width: parent.width - 24px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? #1d4ed8 : #334155;
+        font-size: 14px;
+        font-weight: root.selected ? 600 : 400;
+        vertical-alignment: center;
+    }
+    nav-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+}
+
+component ShortcutRecorder inherits Rectangle {
+    in-out property <string> shortcut;
+    callback record-key(string, bool, bool, bool, bool) -> bool;
+
+    height: 44px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: recorder.has-focus ? #2563eb : #cbd5e1;
+    background: recorder.has-focus ? #eff6ff : #ffffff;
+
+    recorder := FocusScope {
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                self.clear-focus();
+                return accept;
+            }
+            if (root.record-key(
+                event.text,
+                event.modifiers.control,
+                event.modifiers.alt,
+                event.modifiers.shift,
+                event.modifiers.meta,
+            )) {
+                self.clear-focus();
+            }
+            return accept;
+        }
+
+        Text {
+            x: 13px;
+            width: parent.width - 104px;
+            height: parent.height;
+            text: recorder.has-focus ? "请按下新的快捷键" : root.shortcut;
+            color: recorder.has-focus ? #1d4ed8 : #0f172a;
+            font-size: 14px;
+            font-weight: 500;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Rectangle {
+            x: parent.width - 86px;
+            y: 9px;
+            width: 74px;
+            height: 26px;
+            border-radius: 5px;
+            background: recorder.has-focus ? #dbeafe : #f1f5f9;
+            Text {
+                text: recorder.has-focus ? "录入中" : "点击修改";
+                color: recorder.has-focus ? #1d4ed8 : #64748b;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
 export component SettingsWindow inherits Window {
     in-out property <string> shortcut;
     in-out property <string> save-directory;
     in-out property <bool> close-after-copy;
     in property <string> status;
     in property <bool> status-is-error;
+    private property <int> active-section: 0;
 
     callback choose-directory();
+    callback record-shortcut(string, bool, bool, bool, bool) -> bool;
     callback save-settings(string, string, bool);
     callback cancel();
 
     title: "Chaos 截图设置";
-    width: 520px;
-    height: 390px;
-    background: #f8fafc;
+    width: 700px;
+    height: 460px;
+    background: #ffffff;
 
     Rectangle {
-        background: #f8fafc;
+        background: #ffffff;
 
-        Text {
-            x: 24px;
-            y: 20px;
-            text: "Chaos 截图";
-            color: #0f172a;
-            font-size: 20px;
-            font-weight: 600;
-        }
-        Text {
-            x: 24px;
-            y: 54px;
-            text: "全局快捷键";
-            color: #475569;
-            font-size: 13px;
-        }
-        LineEdit {
-            x: 24px;
-            y: 76px;
-            width: 472px;
-            text <=> root.shortcut;
-            placeholder-text: "Ctrl+Shift+S";
-        }
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 180px;
+            height: parent.height;
+            background: #f5f7fa;
+            border-width: 0px;
 
-        Text {
-            x: 24px;
-            y: 126px;
-            text: "保存目录";
-            color: #475569;
-            font-size: 13px;
-        }
-        LineEdit {
-            x: 24px;
-            y: 148px;
-            width: 390px;
-            text <=> root.save-directory;
-        }
-        Button {
-            x: 422px;
-            y: 148px;
-            width: 74px;
-            height: 32px;
-            text: "浏览";
-            clicked => { root.choose-directory(); }
-        }
+            Text {
+                x: 22px;
+                y: 24px;
+                text: "Chaos 截图";
+                color: #0f172a;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            Text {
+                x: 22px;
+                y: 51px;
+                text: "设置";
+                color: #64748b;
+                font-size: 12px;
+            }
 
-        CheckBox {
-            x: 24px;
-            y: 211px;
-            width: 472px;
-            text: "复制成功后关闭截图窗口";
-            checked <=> root.close-after-copy;
+            SettingsNavItem {
+                x: 12px;
+                y: 88px;
+                width: 156px;
+                label: "常规";
+                selected: root.active-section == 0;
+                activated => { root.active-section = 0; }
+            }
+            SettingsNavItem {
+                x: 12px;
+                y: 132px;
+                width: 156px;
+                label: "快捷键";
+                selected: root.active-section == 1;
+                activated => { root.active-section = 1; }
+            }
+            SettingsNavItem {
+                x: 12px;
+                y: 176px;
+                width: 156px;
+                label: "保存";
+                selected: root.active-section == 2;
+                activated => { root.active-section = 2; }
+            }
         }
 
+        if root.active-section == 0: Rectangle {
+            x: 212px;
+            y: 0px;
+            width: 464px;
+            height: 330px;
+            background: transparent;
+
+            Text {
+                y: 27px;
+                text: "常规";
+                color: #0f172a;
+                font-size: 20px;
+                font-weight: 600;
+            }
+            Text {
+                y: 58px;
+                text: "调整截图完成后的默认行为";
+                color: #64748b;
+                font-size: 13px;
+            }
+            Rectangle {
+                y: 96px;
+                width: parent.width;
+                height: 92px;
+                border-radius: 7px;
+                border-width: 1px;
+                border-color: #e2e8f0;
+                background: #f8fafc;
+
+                CheckBox {
+                    x: 16px;
+                    y: 16px;
+                    width: parent.width - 32px;
+                    text: "复制成功后关闭截图窗口";
+                    checked <=> root.close-after-copy;
+                }
+                Text {
+                    x: 42px;
+                    y: 53px;
+                    width: parent.width - 58px;
+                    text: "关闭后程序仍会驻留在后台，可通过快捷键再次截图。";
+                    color: #64748b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if root.active-section == 1: Rectangle {
+            x: 212px;
+            y: 0px;
+            width: 464px;
+            height: 330px;
+            background: transparent;
+
+            Text {
+                y: 27px;
+                text: "快捷键";
+                color: #0f172a;
+                font-size: 20px;
+                font-weight: 600;
+            }
+            Text {
+                y: 58px;
+                text: "设置呼出截图选区的全局快捷键";
+                color: #64748b;
+                font-size: 13px;
+            }
+            Text {
+                y: 99px;
+                text: "开始截图";
+                color: #475569;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            ShortcutRecorder {
+                y: 124px;
+                width: parent.width;
+                shortcut <=> root.shortcut;
+                record-key(key, ctrl, alt, shift, meta) => {
+                    return root.record-shortcut(key, ctrl, alt, shift, meta);
+                }
+            }
+            Text {
+                y: 178px;
+                width: parent.width;
+                text: "点击输入框后直接按下组合键。支持字母、数字、F1-F24 和 PrintScreen。";
+                color: #64748b;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+
+        if root.active-section == 2: Rectangle {
+            x: 212px;
+            y: 0px;
+            width: 464px;
+            height: 330px;
+            background: transparent;
+
+            Text {
+                y: 27px;
+                text: "保存";
+                color: #0f172a;
+                font-size: 20px;
+                font-weight: 600;
+            }
+            Text {
+                y: 58px;
+                text: "选择截图文件的默认保存位置";
+                color: #64748b;
+                font-size: 13px;
+            }
+            Text {
+                y: 99px;
+                text: "保存目录";
+                color: #475569;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            LineEdit {
+                y: 124px;
+                width: 364px;
+                text <=> root.save-directory;
+            }
+            Button {
+                x: 374px;
+                y: 124px;
+                width: 90px;
+                height: 32px;
+                text: "浏览";
+                clicked => { root.choose-directory(); }
+            }
+        }
+
+        Rectangle {
+            x: 180px;
+            y: 394px;
+            width: parent.width - 180px;
+            height: 1px;
+            background: #e2e8f0;
+        }
         Text {
-            x: 24px;
-            y: 259px;
-            width: 472px;
-            height: 42px;
+            x: 212px;
+            y: 344px;
+            width: 464px;
+            height: 38px;
             visible: root.status != "";
             text: root.status;
             color: root.status-is-error ? #b91c1c : #166534;
             font-size: 13px;
             wrap: word-wrap;
-            vertical-alignment: top;
-        }
-
-        Rectangle {
-            x: 0px;
-            y: 319px;
-            width: parent.width;
-            height: 1px;
-            background: #e2e8f0;
+            vertical-alignment: center;
         }
         Button {
-            x: 330px;
-            y: 338px;
+            x: 510px;
+            y: 410px;
             width: 78px;
             height: 34px;
             text: "取消";
             clicked => { root.cancel(); }
         }
         Button {
-            x: 418px;
-            y: 338px;
+            x: 598px;
+            y: 410px;
             width: 78px;
             height: 34px;
             text: "保存";
