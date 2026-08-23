@@ -85,14 +85,14 @@ RGBA8 bitmap, and encodes it to PNG. Golden tests live here.
 
 Owns the application-level session driver and policy above the capture domain:
 
-- `AppSettings` and behavior such as whether a successful copy closes the overlay;
-- `RuntimeCommand` / `RuntimeEvent`, shared by the resident app, settings UI,
-  future hotkey adapters, application CLI integration, and optional IPC;
-- the trusted in-process `RuntimePlugin` boundary and plugin action registry.
+- `RuntimePolicy` and behavior such as whether a successful copy closes the overlay;
+- an internal `RuntimeCommand` / `RuntimeEvent` model used by the resident app;
+- declarative plugin and plugin-action identifiers reserved for a future host.
 
 It is UI- and platform-neutral. It does not create windows, register global
-hotkeys, write the clipboard, persist settings, or dynamically load plugins.
-Those are host responsibilities. See `runtime-and-plugins.md`.
+hotkeys, choose save paths or capture sources, write the clipboard, persist
+settings, or execute plugins. Those are host responsibilities. Its Rust enums
+are not an IPC wire protocol or plugin ABI. See `runtime-and-plugins.md`.
 
 The existing `tools/capture-cli` intentionally remains a low-level diagnostic
 and acceptance tool that can exercise Core and platform adapters directly. A

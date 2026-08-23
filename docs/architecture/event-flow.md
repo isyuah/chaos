@@ -25,8 +25,8 @@ document/annotation mutation, undo, action invocation, and reporting
 `CaptureEvent`s.
 
 The runtime wraps those commands/events without translating them into toolkit
-concepts. It also applies application settings and turns action completion into
-policy events such as `CloseOverlay`.
+concepts. It applies runtime policy and correlates host-side action completion
+with the request that initiated it.
 
 ```text
 Slint / hotkey / app CLI / IPC
@@ -40,8 +40,7 @@ Slint / hotkey / app CLI / IPC
           ▼
     RuntimeEvent
           │
-          ├─ shell rendering / clipboard / windows
-          └─ trusted plugin event dispatch
+          └─ shell rendering / clipboard / windows
 ```
 
 ## 2. State machine

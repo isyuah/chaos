@@ -14,7 +14,9 @@ use capture_core::{
 };
 use capture_platform_api::{CaptureBackend, SnapBackend};
 use capture_render::flatten;
-use capture_runtime::{CaptureRuntime, RuntimeCommand, RuntimeEvent};
+use capture_runtime::{
+    ActionCompletion, ActionRequestId, CaptureRuntime, RuntimeCommand, RuntimeEvent, RuntimePolicy,
+};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
@@ -111,6 +113,21 @@ enum HostPlatform {
     Linux(LinuxPlatform),
 }
 
+#[derive(Debug, Clone)]
+struct AppConfig {
+    save_directory: PathBuf,
+    runtime_policy: RuntimePolicy,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            save_directory: PathBuf::from("."),
+            runtime_policy: RuntimePolicy::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PointerGesture {
     Select,
@@ -149,6 +166,7 @@ impl HostPlatform {
 
 struct Controller {
     host: HostPlatform,
+    config: AppConfig,
     runtime: CaptureRuntime,
     frame: Arc<CapturedFrame>,
     log: TraceLog,
@@ -299,9 +317,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.window()
         .set_position(slint::PhysicalPosition::new(frame.origin.x, frame.origin.y));
     log.duration("startup.window_set_position", window_position_started);
+    let config = AppConfig::default();
     let state = Rc::new(RefCell::new(Controller {
         host,
-        runtime: CaptureRuntime::default(),
+        runtime: CaptureRuntime::new(config.runtime_policy.clone()),
+        config,
         frame: frame.clone(),
         log: log.clone(),
         scale_factor: ui_scale_hint,
@@ -795,6 +815,7 @@ impl Controller {
                     self.set_status(error.to_string())
                 }
                 RuntimeEvent::StatusChanged(message) => self.set_status(message.clone()),
+                RuntimeEvent::Rejected(error) => self.set_status(error.to_string()),
                 _ => {}
             }
         }
@@ -878,8 +899,8 @@ impl Controller {
                     CaptureCommand::InvokeAction(action_id),
                 ));
                 for event in events {
-                    if let RuntimeEvent::ActionRequested(requested) = event {
-                        self.execute_builtin_action(requested, ui);
+                    if let RuntimeEvent::ActionRequested { request_id, action } = event {
+                        self.execute_builtin_action(request_id, action, ui);
                     }
                 }
             }
@@ -892,37 +913,40 @@ impl Controller {
         }
     }
 
-    fn execute_builtin_action(&mut self, action: ActionId, ui: &CaptureWindow) {
+    fn execute_builtin_action(
+        &mut self,
+        request_id: ActionRequestId,
+        action: ActionId,
+        ui: &CaptureWindow,
+    ) {
         let Some(document) = self.document() else {
             return;
         };
         match action {
             ActionId::COPY => match CopyAction.invoke(&document) {
                 Ok(ActionOutcome::Png(_)) => match copy_document_to_clipboard(&document) {
-                    Ok(()) => self.complete_action(action, true, "已复制到剪贴板", ui),
+                    Ok(()) => self.complete_action(request_id, true, "已复制到剪贴板", ui),
                     Err(error) => {
-                        self.complete_action(action, false, format!("复制失败：{error}"), ui)
+                        self.complete_action(request_id, false, format!("复制失败：{error}"), ui)
                     }
                 },
-                Ok(_) => self.complete_action(action, false, "复制失败：返回了未知结果", ui),
-                Err(error) => self.complete_action(action, false, format!("复制失败：{error}"), ui),
+                Ok(_) => self.complete_action(request_id, false, "复制失败：返回了未知结果", ui),
+                Err(error) => {
+                    self.complete_action(request_id, false, format!("复制失败：{error}"), ui)
+                }
             },
             ActionId::SAVE => {
-                let path = self
-                    .runtime
-                    .settings()
-                    .save_directory
-                    .join("capture-slint.png");
+                let path = self.config.save_directory.join("capture-slint.png");
                 match SaveAction::new(&path).invoke(&document) {
                     Ok(ActionOutcome::Saved(path)) => self.complete_action(
-                        action,
+                        request_id,
                         true,
                         format!("已保存到 {}", path.display()),
                         ui,
                     ),
-                    Ok(_) => self.complete_action(action, true, "保存完成", ui),
+                    Ok(_) => self.complete_action(request_id, true, "保存完成", ui),
                     Err(error) => {
-                        self.complete_action(action, false, format!("保存失败：{error}"), ui)
+                        self.complete_action(request_id, false, format!("保存失败：{error}"), ui)
                     }
                 }
             }
@@ -933,7 +957,7 @@ impl Controller {
                             Ok(rendered) => rendered,
                             Err(error) => {
                                 self.complete_action(
-                                    action,
+                                    request_id,
                                     false,
                                     format!("固定截图渲染失败：{error}"),
                                     ui,
@@ -958,34 +982,41 @@ impl Controller {
                         });
                         let _ = pin.show();
                         self.pin_window = Some(pin);
-                        self.complete_action(action, true, "截图已固定为浮动窗口", ui);
+                        self.complete_action(request_id, true, "截图已固定为浮动窗口", ui);
                     }
                     Err(error) => self.complete_action(
-                        action,
+                        request_id,
                         false,
                         format!("固定窗口创建失败：{error}"),
                         ui,
                     ),
                 },
-                Ok(_) => self.complete_action(action, true, "固定完成", ui),
-                Err(error) => self.complete_action(action, false, format!("固定失败：{error}"), ui),
+                Ok(_) => self.complete_action(request_id, true, "固定完成", ui),
+                Err(error) => {
+                    self.complete_action(request_id, false, format!("固定失败：{error}"), ui)
+                }
             },
-            ActionId::ASK_AI => self.complete_action(action, false, "AI 功能尚未接入", ui),
+            ActionId::ASK_AI => self.complete_action(request_id, false, "AI 功能尚未接入", ui),
             _ => {}
         }
     }
 
     fn complete_action(
         &mut self,
-        action: ActionId,
+        request_id: ActionRequestId,
         success: bool,
         message: impl Into<String>,
         ui: &CaptureWindow,
     ) {
-        let events = self.dispatch_runtime(RuntimeCommand::ActionCompleted {
-            action,
-            success,
-            message: Some(message.into()),
+        let message = message.into();
+        let completion = if success {
+            ActionCompletion::succeeded(message)
+        } else {
+            ActionCompletion::failed(message)
+        };
+        let events = self.dispatch_runtime(RuntimeCommand::CompleteAction {
+            request_id,
+            completion,
         });
         if events
             .iter()

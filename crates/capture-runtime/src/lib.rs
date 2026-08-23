@@ -1,108 +1,142 @@
 //! UI-neutral application orchestration for the screenshot application.
 //!
 //! `capture-core` and `capture-annotation` define the capture domain. This
-//! crate owns the next boundary up: application settings, session lifecycle,
-//! and a stable command/event vocabulary that can be driven by Slint, a CLI,
-//! a future settings shell, or an IPC adapter. It deliberately does not own
-//! windows, clipboard access, global-hotkey registration, or plugin loading.
+//! crate owns the next boundary up: runtime policy, session lifecycle, and an
+//! internal command/event model. These Rust enums are allowed to evolve and
+//! are not an IPC wire protocol or plugin ABI.
 
 use capture_annotation::{CaptureCommand, CaptureEvent, CaptureSession, CaptureSessionState};
 use capture_core::action::ActionId;
 use capture_core::capture::Timing;
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 /// What the application should do after a successful copy action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyDisposition {
-    /// Keep the editor open after copying.
     KeepEditorOpen,
-    /// Ask the application shell to close the capture overlay.
     CloseOverlay,
 }
 
-/// User-configurable application behavior.
+/// Behavior that the runtime itself applies.
 ///
-/// This is intentionally toolkit-neutral. A settings window, CLI, or future
-/// plugin host can edit the same value without knowing anything about Slint.
+/// Host-owned configuration such as hotkeys, save paths, capture sources, and
+/// themes deliberately stays outside this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppSettings {
-    /// A portable accelerator string, for example `Ctrl+Shift+4`.
-    pub capture_hotkey: Option<String>,
+pub struct RuntimePolicy {
     pub copy_disposition: CopyDisposition,
-    pub save_directory: PathBuf,
-    pub capture_virtual_desktop: bool,
 }
 
-impl Default for AppSettings {
+impl Default for RuntimePolicy {
     fn default() -> Self {
         Self {
-            capture_hotkey: None,
             copy_disposition: CopyDisposition::KeepEditorOpen,
-            save_directory: PathBuf::from("."),
-            capture_virtual_desktop: true,
         }
     }
 }
 
-/// Commands accepted by the application runtime.
-///
-/// `Capture` preserves the existing Core session command vocabulary. The
-/// wrapper gives higher-level callers a place to add application behavior
-/// without making the UI call the session directly.
-#[derive(Debug, Clone)]
-pub enum RuntimeCommand {
-    /// Start a new capture session and let the shell perform the capture.
-    BeginCapture,
-    /// Deliver a domain command or captured frame to the runtime.
-    Capture(CaptureCommand),
-    /// Replace the user-facing application settings.
-    SetSettings(AppSettings),
-    /// Tell the runtime that a shell-side action finished.
-    ActionCompleted {
-        action: ActionId,
-        success: bool,
-        message: Option<String>,
-    },
-    /// Request an action contributed by a registered plugin.
-    InvokePluginAction(PluginActionId),
+/// Correlates one host-side action execution with the runtime request that
+/// created it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActionRequestId(u64);
+
+impl ActionRequestId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
-/// Runtime-level events. Domain events are retained instead of translated
-/// into UI concepts so a second frontend can render the same session state.
+/// Result of a host-side action such as clipboard copy or file save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionCompletion {
+    Succeeded { message: Option<String> },
+    Failed { message: Option<String> },
+}
+
+impl ActionCompletion {
+    pub fn succeeded(message: impl Into<String>) -> Self {
+        Self::Succeeded {
+            message: Some(message.into()),
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: Some(message.into()),
+        }
+    }
+}
+
+/// Internal application commands accepted by the runtime.
+#[derive(Debug, Clone)]
+pub enum RuntimeCommand {
+    BeginCapture,
+    Capture(CaptureCommand),
+    SetPolicy(RuntimePolicy),
+    CompleteAction {
+        request_id: ActionRequestId,
+        completion: ActionCompletion,
+    },
+}
+
+/// Internal application events emitted by the runtime.
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     Session(CaptureEvent),
     CaptureStarted,
-    SettingsChanged(AppSettings),
-    ActionRequested(ActionId),
-    PluginActionRequested(PluginActionId),
+    PolicyChanged(RuntimePolicy),
+    ActionRequested {
+        request_id: ActionRequestId,
+        action: ActionId,
+    },
     StatusChanged(String),
     CloseOverlay,
+    Rejected(RuntimeError),
 }
 
-/// The application-level owner of one capture session and its policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeError {
+    UnknownActionRequest(ActionRequestId),
+}
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownActionRequest(request_id) => {
+                write!(formatter, "unknown action request: {}", request_id.get())
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {}
+
+/// Application-level owner of one capture session and its pending actions.
 #[derive(Debug, Clone)]
 pub struct CaptureRuntime {
     session: CaptureSession,
-    settings: AppSettings,
+    policy: RuntimePolicy,
+    next_action_request_id: u64,
+    pending_actions: HashMap<ActionRequestId, ActionId>,
 }
 
 impl Default for CaptureRuntime {
     fn default() -> Self {
-        Self::new(AppSettings::default())
+        Self::new(RuntimePolicy::default())
     }
 }
 
 impl CaptureRuntime {
-    pub fn new(settings: AppSettings) -> Self {
+    pub fn new(policy: RuntimePolicy) -> Self {
         Self {
             session: CaptureSession::new(),
-            settings,
+            policy,
+            next_action_request_id: 1,
+            pending_actions: HashMap::new(),
         }
     }
 
-    pub fn settings(&self) -> &AppSettings {
-        &self.settings
+    pub fn policy(&self) -> &RuntimePolicy {
+        &self.policy
     }
 
     pub fn state(&self) -> &CaptureSessionState {
@@ -124,29 +158,23 @@ impl CaptureRuntime {
         }
     }
 
-    /// Dispatch one application command and return all resulting events.
     pub fn dispatch(&mut self, command: RuntimeCommand) -> Vec<RuntimeEvent> {
         match command {
             RuntimeCommand::BeginCapture => self.begin_capture(),
             RuntimeCommand::Capture(command) => self.dispatch_capture(command),
-            RuntimeCommand::SetSettings(settings) => {
-                self.settings = settings.clone();
-                vec![RuntimeEvent::SettingsChanged(settings)]
+            RuntimeCommand::SetPolicy(policy) => {
+                self.policy = policy.clone();
+                vec![RuntimeEvent::PolicyChanged(policy)]
             }
-            RuntimeCommand::ActionCompleted {
-                action,
-                success,
-                message,
-            } => self.action_completed(action, success, message),
-            RuntimeCommand::InvokePluginAction(action) => {
-                vec![RuntimeEvent::PluginActionRequested(action)]
-            }
+            RuntimeCommand::CompleteAction {
+                request_id,
+                completion,
+            } => self.complete_action(request_id, completion),
         }
     }
 
     fn begin_capture(&mut self) -> Vec<RuntimeEvent> {
-        // A resident host may start a new capture while the previous overlay is
-        // still active. Each request owns a fresh domain session.
+        self.pending_actions.clear();
         self.session = CaptureSession::new();
         let mut events = vec![RuntimeEvent::CaptureStarted];
         events.extend(self.dispatch_capture(CaptureCommand::Begin));
@@ -154,22 +182,51 @@ impl CaptureRuntime {
     }
 
     fn dispatch_capture(&mut self, command: CaptureCommand) -> Vec<RuntimeEvent> {
-        self.session
-            .apply(command)
-            .into_iter()
-            .map(|event| match event {
-                CaptureEvent::ActionRequested(action) => RuntimeEvent::ActionRequested(action),
-                event => RuntimeEvent::Session(event),
-            })
-            .collect()
+        let session_events = self.session.apply(command);
+        let completed = session_events
+            .iter()
+            .any(|event| matches!(event, CaptureEvent::Completed));
+        let mut events = Vec::with_capacity(session_events.len());
+        for event in session_events {
+            match event {
+                CaptureEvent::ActionRequested(action) => {
+                    let request_id = self.allocate_action_request_id();
+                    self.pending_actions.insert(request_id, action);
+                    events.push(RuntimeEvent::ActionRequested { request_id, action });
+                }
+                event => events.push(RuntimeEvent::Session(event)),
+            }
+        }
+        if completed {
+            self.pending_actions.clear();
+        }
+        events
     }
 
-    fn action_completed(
-        &self,
-        action: ActionId,
-        success: bool,
-        message: Option<String>,
+    fn allocate_action_request_id(&mut self) -> ActionRequestId {
+        loop {
+            let request_id = ActionRequestId(self.next_action_request_id);
+            self.next_action_request_id = self.next_action_request_id.checked_add(1).unwrap_or(1);
+            if !self.pending_actions.contains_key(&request_id) {
+                return request_id;
+            }
+        }
+    }
+
+    fn complete_action(
+        &mut self,
+        request_id: ActionRequestId,
+        completion: ActionCompletion,
     ) -> Vec<RuntimeEvent> {
+        let Some(action) = self.pending_actions.remove(&request_id) else {
+            return vec![RuntimeEvent::Rejected(RuntimeError::UnknownActionRequest(
+                request_id,
+            ))];
+        };
+        let (success, message) = match completion {
+            ActionCompletion::Succeeded { message } => (true, message),
+            ActionCompletion::Failed { message } => (false, message),
+        };
         let fallback = if success {
             format!("{action} completed")
         } else {
@@ -178,7 +235,7 @@ impl CaptureRuntime {
         let mut events = vec![RuntimeEvent::StatusChanged(message.unwrap_or(fallback))];
         if success
             && action == ActionId::COPY
-            && self.settings.copy_disposition == CopyDisposition::CloseOverlay
+            && self.policy.copy_disposition == CopyDisposition::CloseOverlay
         {
             events.push(RuntimeEvent::CloseOverlay);
         }
@@ -186,11 +243,10 @@ impl CaptureRuntime {
     }
 }
 
-/// Metadata exposed by a future plugin registry.
+/// Declarative metadata reserved for a future plugin host.
 ///
-/// The first version intentionally contains only declarative fields. Dynamic
-/// loading and permission negotiation can be added behind this boundary once
-/// the plugin use cases and trust model are concrete.
+/// No execution trait is exposed yet. The first real plugin will determine the
+/// required context, result, permission, and isolation contracts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginDescriptor {
     pub id: String,
@@ -199,7 +255,7 @@ pub struct PluginDescriptor {
     pub actions: Vec<String>,
 }
 
-/// Owned identifier for an action contributed at runtime by a plugin.
+/// Owned identifier for an action contributed at runtime by a future plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PluginActionId {
     pub plugin_id: String,
@@ -215,135 +271,42 @@ impl PluginActionId {
     }
 }
 
-/// In-process extension point for trusted plugins.
-///
-/// A plugin receives the same command/event vocabulary as every other runtime
-/// caller. The host remains responsible for permissions, isolation, dynamic
-/// loading, and dispatching shell-only effects such as windows or clipboard
-/// access.
-pub trait RuntimePlugin: Send {
-    fn descriptor(&self) -> &PluginDescriptor;
-
-    fn on_event(&mut self, event: &RuntimeEvent) -> Vec<RuntimeCommand>;
-
-    fn invoke(&mut self, action_id: &str) -> Result<Vec<RuntimeCommand>, String>;
-}
-
-/// Registry used by an application host to keep plugin identities unique and
-/// dispatch runtime events without exposing UI objects to extensions.
-#[derive(Default)]
-pub struct PluginRegistry {
-    plugins: Vec<Box<dyn RuntimePlugin>>,
-}
-
-impl PluginRegistry {
-    pub fn register(&mut self, plugin: Box<dyn RuntimePlugin>) -> Result<(), PluginRegistryError> {
-        let id = plugin.descriptor().id.trim();
-        if id.is_empty() {
-            return Err(PluginRegistryError::InvalidId);
-        }
-        if self
-            .plugins
-            .iter()
-            .any(|registered| registered.descriptor().id == id)
-        {
-            return Err(PluginRegistryError::DuplicateId(id.to_string()));
-        }
-        self.plugins.push(plugin);
-        Ok(())
-    }
-
-    pub fn descriptors(&self) -> impl Iterator<Item = &PluginDescriptor> {
-        self.plugins.iter().map(|plugin| plugin.descriptor())
-    }
-
-    pub fn dispatch_event(&mut self, event: &RuntimeEvent) -> Vec<RuntimeCommand> {
-        self.plugins
-            .iter_mut()
-            .flat_map(|plugin| plugin.on_event(event))
-            .collect()
-    }
-
-    pub fn invoke(
-        &mut self,
-        action: &PluginActionId,
-    ) -> Result<Vec<RuntimeCommand>, PluginRegistryError> {
-        let plugin = self
-            .plugins
-            .iter_mut()
-            .find(|plugin| plugin.descriptor().id == action.plugin_id)
-            .ok_or_else(|| PluginRegistryError::UnknownPlugin(action.plugin_id.clone()))?;
-        if !plugin
-            .descriptor()
-            .actions
-            .iter()
-            .any(|registered| registered == &action.action_id)
-        {
-            return Err(PluginRegistryError::UnknownAction(action.clone()));
-        }
-        plugin
-            .invoke(&action.action_id)
-            .map_err(|message| PluginRegistryError::InvocationFailed {
-                action: action.clone(),
-                message,
-            })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginRegistryError {
-    InvalidId,
-    DuplicateId(String),
-    UnknownPlugin(String),
-    UnknownAction(PluginActionId),
-    InvocationFailed {
-        action: PluginActionId,
-        message: String,
-    },
-}
-
-impl std::fmt::Display for PluginRegistryError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidId => formatter.write_str("plugin id must not be empty"),
-            Self::DuplicateId(id) => write!(formatter, "plugin id is already registered: {id}"),
-            Self::UnknownPlugin(id) => write!(formatter, "plugin is not registered: {id}"),
-            Self::UnknownAction(action) => write!(
-                formatter,
-                "plugin action is not registered: {}:{}",
-                action.plugin_id, action.action_id
-            ),
-            Self::InvocationFailed { action, message } => write!(
-                formatter,
-                "plugin action failed: {}:{}: {message}",
-                action.plugin_id, action.action_id
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PluginRegistryError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capture_core::capture::{CapturedFrame, PixelFormat};
+    use capture_core::geometry::PhysicalPoint;
 
-    struct TestPlugin {
-        descriptor: PluginDescriptor,
+    fn frame() -> CapturedFrame {
+        CapturedFrame::new(
+            vec![0x80; 4 * 4 * 4].into(),
+            4,
+            4,
+            16,
+            PhysicalPoint::ZERO,
+            PixelFormat::Rgba8,
+        )
     }
 
-    impl RuntimePlugin for TestPlugin {
-        fn descriptor(&self) -> &PluginDescriptor {
-            &self.descriptor
-        }
+    fn editing_runtime(policy: RuntimePolicy) -> CaptureRuntime {
+        let mut runtime = CaptureRuntime::new(policy);
+        runtime.dispatch(RuntimeCommand::BeginCapture);
+        runtime.dispatch(RuntimeCommand::Capture(CaptureCommand::FrameReady(frame())));
+        runtime.dispatch(RuntimeCommand::Capture(CaptureCommand::CommitSelection));
+        runtime
+    }
 
-        fn on_event(&mut self, _event: &RuntimeEvent) -> Vec<RuntimeCommand> {
-            Vec::new()
-        }
-
-        fn invoke(&mut self, _action_id: &str) -> Result<Vec<RuntimeCommand>, String> {
-            Ok(vec![RuntimeCommand::BeginCapture])
-        }
+    fn request_action(runtime: &mut CaptureRuntime, action: ActionId) -> ActionRequestId {
+        runtime
+            .dispatch(RuntimeCommand::Capture(CaptureCommand::InvokeAction(
+                action,
+            )))
+            .into_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ActionRequested { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .expect("action request")
     }
 
     #[test]
@@ -373,15 +336,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_policy_emits_close_event_only_when_enabled() {
-        let mut runtime = CaptureRuntime::new(AppSettings {
+    fn successful_copy_closes_only_for_a_matching_request() {
+        let mut runtime = editing_runtime(RuntimePolicy {
             copy_disposition: CopyDisposition::CloseOverlay,
-            ..AppSettings::default()
         });
-        let events = runtime.dispatch(RuntimeCommand::ActionCompleted {
-            action: ActionId::COPY,
-            success: true,
-            message: None,
+        let request_id = request_action(&mut runtime, ActionId::COPY);
+        let events = runtime.dispatch(RuntimeCommand::CompleteAction {
+            request_id,
+            completion: ActionCompletion::Succeeded { message: None },
         });
 
         assert!(events
@@ -390,46 +352,36 @@ mod tests {
     }
 
     #[test]
-    fn plugin_ids_are_unique() {
-        let plugin = || {
-            Box::new(TestPlugin {
-                descriptor: PluginDescriptor {
-                    id: "example.tool".to_string(),
-                    name: "Example".to_string(),
-                    version: "1.0.0".to_string(),
-                    actions: vec!["example-action".to_string()],
-                },
-            }) as Box<dyn RuntimePlugin>
-        };
-        let mut registry = PluginRegistry::default();
+    fn unknown_or_already_completed_action_is_rejected() {
+        let mut runtime = editing_runtime(RuntimePolicy::default());
+        let request_id = request_action(&mut runtime, ActionId::COPY);
+        runtime.dispatch(RuntimeCommand::CompleteAction {
+            request_id,
+            completion: ActionCompletion::Succeeded { message: None },
+        });
+        let events = runtime.dispatch(RuntimeCommand::CompleteAction {
+            request_id,
+            completion: ActionCompletion::Succeeded { message: None },
+        });
 
-        registry.register(plugin()).unwrap();
-        assert_eq!(
-            registry.register(plugin()),
-            Err(PluginRegistryError::DuplicateId("example.tool".to_string()))
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [RuntimeEvent::Rejected(RuntimeError::UnknownActionRequest(id))] if *id == request_id
+        ));
     }
 
     #[test]
-    fn plugin_actions_use_owned_runtime_ids() {
-        let mut registry = PluginRegistry::default();
-        registry
-            .register(Box::new(TestPlugin {
-                descriptor: PluginDescriptor {
-                    id: "example.tool".to_string(),
-                    name: "Example".to_string(),
-                    version: "1.0.0".to_string(),
-                    actions: vec!["capture-again".to_string()],
-                },
-            }))
-            .unwrap();
+    fn starting_a_new_capture_invalidates_pending_actions() {
+        let mut runtime = editing_runtime(RuntimePolicy::default());
+        let request_id = request_action(&mut runtime, ActionId::SAVE);
+        runtime.dispatch(RuntimeCommand::BeginCapture);
+        let events = runtime.dispatch(RuntimeCommand::CompleteAction {
+            request_id,
+            completion: ActionCompletion::Succeeded { message: None },
+        });
 
-        let commands = registry
-            .invoke(&PluginActionId::new("example.tool", "capture-again"))
-            .unwrap();
-        assert!(matches!(
-            commands.as_slice(),
-            [RuntimeCommand::BeginCapture]
-        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::Rejected(_))));
     }
 }
