@@ -10,8 +10,8 @@ the state, while the runtime is the single application-level command boundary.
 The application shell (or a future user-facing application CLI) is responsible
 for:
 
-- capturing the frame (`CaptureBackend::capture_monitor`) and delivering it as
-  `CaptureCommand::FrameReady(CapturedFrame)`;
+- capturing the frame asynchronously after `CaptureRequested` and returning it
+  as `RuntimeCommand::FrameReady { session_id, frame }`;
 - translating OS pointer events into `PhysicalPoint`s (already in physical
   pixels);
 - interpreting snap candidates from `SnapBackend::candidates_at` and telling the
@@ -25,8 +25,8 @@ document/annotation mutation, undo, action invocation, and reporting
 `CaptureEvent`s.
 
 The runtime wraps those commands/events without translating them into toolkit
-concepts. It applies runtime policy and correlates host-side action completion
-with the request that initiated it.
+concepts. It applies runtime policy and correlates both asynchronous capture
+results and host-side action completion with the requests that initiated them.
 
 ```text
 Slint / hotkey / app CLI / IPC
@@ -42,6 +42,11 @@ Slint / hotkey / app CLI / IPC
           │
           └─ shell rendering / clipboard / windows
 ```
+
+`CaptureCommand::Begin` and `CaptureCommand::FrameReady` are lifecycle details
+inside the runtime. Hosts use `RuntimeCommand::BeginCapture`, then return the
+matching session ID through `RuntimeCommand::FrameReady` or `FrameFailed`.
+This prevents a slow result from an older capture from replacing a newer one.
 
 ## 2. State machine
 

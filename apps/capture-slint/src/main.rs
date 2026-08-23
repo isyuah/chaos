@@ -1,11 +1,13 @@
 #![allow(clippy::type_complexity)]
 
+mod desktop;
+
 use arboard::{Clipboard, ImageData};
 use capture_actions::{ActionOutcome, CaptureAction, CopyAction, PinAction, SaveAction};
 use capture_annotation::{
     Annotation, AnnotationTool, CaptureCommand, CaptureEvent, CaptureSessionState,
 };
-use capture_core::capture::CapturedFrame;
+use capture_core::capture::{CapturedFrame, PixelFormat};
 use capture_core::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
 use capture_core::selection::{ResizeHandle, SelectionInteraction, SelectionSession};
 use capture_core::{
@@ -15,8 +17,10 @@ use capture_core::{
 use capture_platform_api::{CaptureBackend, SnapBackend};
 use capture_render::flatten;
 use capture_runtime::{
-    ActionCompletion, ActionRequestId, CaptureRuntime, RuntimeCommand, RuntimeEvent, RuntimePolicy,
+    ActionCompletion, ActionRequestId, CaptureRuntime, CaptureSessionId, RuntimeCommand,
+    RuntimeError, RuntimeEvent, RuntimePolicy,
 };
+use desktop::{DesktopCommand, DesktopIntegration};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
@@ -26,7 +30,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 slint::include_modules!();
@@ -117,6 +121,9 @@ enum HostPlatform {
 struct AppConfig {
     save_directory: PathBuf,
     runtime_policy: RuntimePolicy,
+    capture_monitor: Option<usize>,
+    ui_scale_factor: Option<f64>,
+    capture_on_startup: bool,
 }
 
 impl Default for AppConfig {
@@ -124,8 +131,28 @@ impl Default for AppConfig {
         Self {
             save_directory: PathBuf::from("."),
             runtime_policy: RuntimePolicy::default(),
+            capture_monitor: std::env::var("CAPTURE_MONITOR")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok()),
+            ui_scale_factor: std::env::var("SLINT_SCALE_FACTOR")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| *value > 0.1),
+            capture_on_startup: std::env::var("CAPTURE_ON_STARTUP")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         }
     }
+}
+
+struct CapturedSnapshot {
+    frame: Arc<CapturedFrame>,
+    capture_scale_factor: f64,
+    monitors: Vec<MonitorInfo>,
+}
+
+struct CaptureFinished {
+    session_id: CaptureSessionId,
+    result: Result<CapturedSnapshot, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,114 +244,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_started = Instant::now();
     let host = make_host()?;
     log.duration("startup.host_ready", host_started);
-    let ordinal = std::env::var("CAPTURE_MONITOR")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    let (frame, _capture_scale_factor) = if let Some(ordinal) = ordinal {
-        let monitors_started = Instant::now();
-        let monitors = host.capture().monitors()?;
-        log.duration("startup.monitors", monitors_started);
-        let monitor = monitors
-            .get(ordinal)
-            .ok_or_else(|| format!("monitor ordinal {ordinal} is unavailable"))?;
-        log.event(
-            "startup.monitor.selected",
-            format!(
-                "ordinal={ordinal} id={} name={} bounds={}x{}+{}+{} scale={:.3}",
-                monitor.id.0,
-                monitor.name,
-                monitor.bounds.width(),
-                monitor.bounds.height(),
-                monitor.bounds.origin.x,
-                monitor.bounds.origin.y,
-                monitor.scale_factor.get(),
-            ),
-        );
-        let capture_started = Instant::now();
-        let captured = host.capture().capture_monitor(monitor.id)?;
-        log.duration("startup.capture_monitor", capture_started);
-        let rgba_started = Instant::now();
-        let frame = Arc::new(captured.to_rgba8()?);
-        log.duration("startup.frame_to_rgba8", rgba_started);
-        (frame, monitor.scale_factor.get().max(0.1))
-    } else {
-        let capture_started = Instant::now();
-        let captured = host.capture().capture_virtual_desktop()?;
-        log.duration("startup.capture_virtual_desktop", capture_started);
-        let rgba_started = Instant::now();
-        let frame = Arc::new(captured.to_rgba8()?);
-        log.duration("startup.frame_to_rgba8", rgba_started);
-        (frame.clone(), 1.0)
-    };
-    log.event(
-        "startup.frame_ready",
-        format!(
-            "width={} height={} stride={} origin=({}, {}) bytes={}",
-            frame.width,
-            frame.height,
-            frame.stride,
-            frame.origin.x,
-            frame.origin.y,
-            frame.pixels.len(),
-        ),
-    );
-
-    let monitors = match host.capture().monitors() {
-        Ok(monitors) => monitors,
-        Err(error) => {
-            log.event("startup.monitors.error", format!("error={error}"));
-            Vec::new()
-        }
-    };
-    for monitor in &monitors {
-        log.event(
-            "startup.monitor",
-            format!(
-                "name={} bounds={}x{}+{}+{} work_area={}x{}+{}+{} scale={:.3}",
-                monitor.name,
-                monitor.bounds.width(),
-                monitor.bounds.height(),
-                monitor.bounds.origin.x,
-                monitor.bounds.origin.y,
-                monitor.work_area.width(),
-                monitor.work_area.height(),
-                monitor.work_area.origin.x,
-                monitor.work_area.origin.y,
-                monitor.scale_factor.get(),
-            ),
-        );
-    }
-
     let ui_started = Instant::now();
     let ui = CaptureWindow::new()?;
     log.duration("startup.ui_created", ui_started);
-    let ui_scale_hint = std::env::var("SLINT_SCALE_FACTOR")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| *value > 0.1)
-        .unwrap_or(1.0);
-    if ui_scale_hint > 1.01 {
+    let config = AppConfig::default();
+    if let Some(ui_scale_factor) = config.ui_scale_factor {
         log.event(
             "startup.ui_scale_hint",
-            format!("scale_factor={ui_scale_hint:.3}"),
+            format!("scale_factor={ui_scale_factor:.3}"),
         );
     }
-    let window_size_started = Instant::now();
-    ui.window()
-        .set_size(slint::PhysicalSize::new(frame.width, frame.height));
-    log.duration("startup.window_set_size", window_size_started);
-    let window_position_started = Instant::now();
-    ui.window()
-        .set_position(slint::PhysicalPosition::new(frame.origin.x, frame.origin.y));
-    log.duration("startup.window_set_position", window_position_started);
-    let config = AppConfig::default();
+    let frame = placeholder_frame();
     let state = Rc::new(RefCell::new(Controller {
         host,
         runtime: CaptureRuntime::new(config.runtime_policy.clone()),
         config,
         frame: frame.clone(),
         log: log.clone(),
-        scale_factor: ui_scale_hint,
+        scale_factor: 1.0,
         status: String::new(),
         status_revision: 0,
         pin_window: None,
@@ -332,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_visual_at: None,
         pointer_moves: 0,
         last_move_log_at: None,
-        monitors,
+        monitors: Vec::new(),
         pointer_gesture: None,
         last_pointer: None,
         toolbar_override: None,
@@ -340,34 +277,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         overlay_token: None,
         last_toolbar_log_at: std::cell::Cell::new(None),
     }));
-
-    {
-        let mut controller = state.borrow_mut();
-        let initial_refresh_started = Instant::now();
-        let session_begin_started = Instant::now();
-        controller.dispatch_runtime(RuntimeCommand::BeginCapture);
-        controller
-            .log
-            .duration("startup.session_begin", session_begin_started);
-        let session_frame_started = Instant::now();
-        controller.dispatch_runtime(RuntimeCommand::Capture(CaptureCommand::FrameReady(
-            (*frame).clone(),
-        )));
-        controller
-            .log
-            .duration("startup.session_frame_ready", session_frame_started);
-        let image_started = Instant::now();
-        ui.set_frame_image(image_from_frame(&controller.frame));
-        ui.set_canvas_cursor_kind("default".into());
-        ui.set_toolbar_cursor_kind("grab".into());
-        controller.log.duration("render.frame_image", image_started);
-        refresh_selection_geometry(&ui, &controller);
-        refresh_editor_overlay(&ui, &controller);
-        controller
-            .log
-            .duration("startup.initial_ui_refresh", initial_refresh_started);
-    }
-    log.event("startup.initial_ui_ready", "true");
+    ui.set_canvas_cursor_kind("default".into());
+    ui.set_toolbar_cursor_kind("grab".into());
 
     {
         let state = state.clone();
@@ -653,71 +564,406 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let show_started = Instant::now();
-    ui.show()?;
-    log.duration("startup.ui_show", show_started);
+    let (desktop_sender, desktop_receiver) = mpsc::channel();
+    let (capture_sender, capture_receiver) = mpsc::channel();
+    let desktop_integration = Rc::new(RefCell::new(None::<DesktopIntegration>));
+
     {
-        let mut controller = state.borrow_mut();
-        let actual_scale = ui.window().scale_factor() as f64;
-        let capture_scale = controller.scale_factor;
-        let scale_changed = (controller.scale_factor - actual_scale).abs() > 0.01;
-        if ui_scale_hint <= 1.01 {
-            controller.scale_factor = actual_scale;
-        }
-        let bounds = controller.frame.bounds();
-        sync_window_geometry(&ui, &controller, bounds);
-        if scale_changed {
-            refresh_selection_geometry(&ui, &controller);
-            refresh_editor_overlay(&ui, &controller);
-            controller.log.event(
-                "startup.scale_reconciled",
-                format!("capture_scale={capture_scale:.3} ui_scale={actual_scale:.3}"),
+        let integration = desktop_integration.clone();
+        let desktop_sender = desktop_sender.clone();
+        let log = log.clone();
+        let capture_on_startup = state.borrow().config.capture_on_startup;
+        let native_wayland = uses_native_wayland_capture();
+        let ui_weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            let startup = desktop::initialize(desktop_sender.clone(), native_wayland);
+            for message in startup.messages {
+                log.event("desktop.initialize.warning", message);
+            }
+            *integration.borrow_mut() = Some(startup.integration);
+            if let Some(ui) = ui_weak.upgrade() {
+                let warmup_started = Instant::now();
+                ui.set_warmup(true);
+                ui.window().set_size(slint::PhysicalSize::new(1, 1));
+                ui.window()
+                    .set_position(slint::PhysicalPosition::new(-32_000, -32_000));
+                match ui.show().and_then(|()| ui.hide()) {
+                    Ok(()) => log.duration("startup.renderer_warmup", warmup_started),
+                    Err(error) => {
+                        log.event("startup.renderer_warmup.error", format!("error={error}"))
+                    }
+                }
+                ui.set_warmup(false);
+            }
+            log.event(
+                "desktop.initialize.ready",
+                "shortcut=Ctrl+Shift+S tray=true",
             );
-        }
-        controller.sync_snap_exclusions(&ui);
-        controller.log.event(
-            "startup.window_ready",
-            format!(
-                "scale_factor={:.3} position=({}, {}) size={}x{}",
-                controller.scale_factor,
-                controller.frame.origin.x,
-                controller.frame.origin.y,
-                controller.frame.width,
-                controller.frame.height,
-            ),
-        );
+            if capture_on_startup {
+                let _ = desktop_sender.send(DesktopCommand::Capture);
+            }
+        });
     }
-    log.event("startup.event_loop.begin", "true");
-    // Winit applies the native position/scale during the first event-loop
-    // turn. Refresh once after that turn so the initial selecting overlay uses
-    // the same geometry as subsequent tool changes.
+
+    let event_timer = slint::Timer::default();
     {
         let state = state.clone();
         let ui_weak = ui.as_weak();
-        slint::Timer::single_shot(Duration::from_millis(1), move || {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-            let mut controller = state.borrow_mut();
-            if ui_scale_hint <= 1.01 {
-                controller.scale_factor = ui.window().scale_factor() as f64;
-            }
-            let bounds = controller.frame.bounds();
-            sync_window_geometry(&ui, &controller, bounds);
-            refresh_ui(&ui, &controller);
-            controller.log.event("startup.deferred_ui_refresh", "true");
-        });
+        let capture_sender = capture_sender.clone();
+        event_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(8),
+            move || {
+                let Some(ui) = ui_weak.upgrade() else {
+                    return;
+                };
+                while let Ok(command) = desktop_receiver.try_recv() {
+                    match command {
+                        DesktopCommand::Capture => {
+                            request_capture(&ui, &state, capture_sender.clone())
+                        }
+                        DesktopCommand::Quit => {
+                            let _ = ui.hide();
+                            let _ = slint::quit_event_loop();
+                        }
+                        #[cfg(target_os = "linux")]
+                        DesktopCommand::Error(message) => {
+                            let mut controller = state.borrow_mut();
+                            controller.log.event("desktop.error", &message);
+                            controller.set_status(message);
+                        }
+                    }
+                }
+                while let Ok(finished) = capture_receiver.try_recv() {
+                    finish_capture(&ui, &state, finished);
+                }
+            },
+        );
     }
+
+    log.event("startup.resident_ready", "overlay=hidden");
+    log.event("startup.event_loop.begin", "true");
     let event_loop_started = Instant::now();
-    slint::run_event_loop()?;
+    slint::run_event_loop_until_quit()?;
     log.event("shutdown.event_loop.end", "true");
     log.duration("shutdown.event_loop.total", event_loop_started);
     let cleanup_started = Instant::now();
+    drop(event_timer);
+    drop(desktop_integration);
     drop(ui);
     drop(state);
     log.duration("shutdown.resources_drop", cleanup_started);
     log.flush();
     Ok(())
+}
+
+fn request_capture(
+    ui: &CaptureWindow,
+    state: &Rc<RefCell<Controller>>,
+    sender: mpsc::Sender<CaptureFinished>,
+) {
+    let request_started = Instant::now();
+    let _ = ui.hide();
+    let (session_id, monitor_ordinal, log) = {
+        let mut controller = state.borrow_mut();
+        controller.host.snap().set_excluded_windows(&[]);
+        controller.overlay_token = None;
+        controller.pointer_gesture = None;
+        controller.last_pointer = None;
+        controller.toolbar_override = None;
+        controller.toolbar_drag_offset = None;
+        controller.last_snap_at = None;
+        controller.last_visual_at = None;
+        controller.set_status("正在截图…");
+        let events = controller.dispatch_runtime(RuntimeCommand::BeginCapture);
+        let Some(session_id) = events.into_iter().find_map(|event| match event {
+            RuntimeEvent::CaptureRequested { session_id } => Some(session_id),
+            _ => None,
+        }) else {
+            controller.set_status("无法创建截图会话");
+            return;
+        };
+        controller.log.event(
+            "capture.requested",
+            format!(
+                "session={} monitor={}",
+                session_id.get(),
+                controller
+                    .config
+                    .capture_monitor
+                    .map_or_else(|| "virtual".into(), |ordinal| ordinal.to_string())
+            ),
+        );
+        (
+            session_id,
+            controller.config.capture_monitor,
+            controller.log.clone(),
+        )
+    };
+
+    let worker_sender = sender.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("capture-session-{}", session_id.get()))
+        .spawn(move || {
+            let result = capture_snapshot(monitor_ordinal, &log);
+            let _ = worker_sender.send(CaptureFinished { session_id, result });
+        });
+    if let Err(error) = spawn_result {
+        let _ = sender.send(CaptureFinished {
+            session_id,
+            result: Err(format!("无法启动截图任务：{error}")),
+        });
+    }
+    state
+        .borrow()
+        .log
+        .duration("capture.request.dispatch", request_started);
+}
+
+fn capture_snapshot(
+    monitor_ordinal: Option<usize>,
+    log: &TraceLog,
+) -> Result<CapturedSnapshot, String> {
+    let host_started = Instant::now();
+    let host = make_host()?;
+    log.duration("capture.host_ready", host_started);
+
+    let monitors_started = Instant::now();
+    let monitors = if monitor_ordinal.is_none() && uses_native_wayland_capture() {
+        Vec::new()
+    } else {
+        host.capture()
+            .monitors()
+            .map_err(|error| error.to_string())?
+    };
+    log.duration("capture.monitors", monitors_started);
+    for monitor in &monitors {
+        log.event(
+            "capture.monitor",
+            format!(
+                "name={} bounds={}x{}+{}+{} work_area={}x{}+{}+{} scale={:.3}",
+                monitor.name,
+                monitor.bounds.width(),
+                monitor.bounds.height(),
+                monitor.bounds.origin.x,
+                monitor.bounds.origin.y,
+                monitor.work_area.width(),
+                monitor.work_area.height(),
+                monitor.work_area.origin.x,
+                monitor.work_area.origin.y,
+                monitor.scale_factor.get(),
+            ),
+        );
+    }
+
+    let capture_started = Instant::now();
+    let (captured, capture_scale_factor) = if let Some(ordinal) = monitor_ordinal {
+        let monitor = monitors
+            .get(ordinal)
+            .ok_or_else(|| format!("monitor ordinal {ordinal} is unavailable"))?;
+        log.event(
+            "capture.monitor.selected",
+            format!(
+                "ordinal={ordinal} id={} name={} bounds={}x{}+{}+{} scale={:.3}",
+                monitor.id.0,
+                monitor.name,
+                monitor.bounds.width(),
+                monitor.bounds.height(),
+                monitor.bounds.origin.x,
+                monitor.bounds.origin.y,
+                monitor.scale_factor.get(),
+            ),
+        );
+        (
+            host.capture()
+                .capture_monitor(monitor.id)
+                .map_err(|error| error.to_string())?,
+            monitor.scale_factor.get().max(0.1),
+        )
+    } else {
+        (
+            host.capture()
+                .capture_virtual_desktop()
+                .map_err(|error| error.to_string())?,
+            1.0,
+        )
+    };
+    log.duration("capture.frame", capture_started);
+    let rgba_started = Instant::now();
+    let frame = Arc::new(captured.to_rgba8().map_err(|error| error.to_string())?);
+    log.duration("capture.frame_to_rgba8", rgba_started);
+    log.event(
+        "capture.frame_ready",
+        format!(
+            "width={} height={} stride={} origin=({}, {}) bytes={}",
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.origin.x,
+            frame.origin.y,
+            frame.pixels.len(),
+        ),
+    );
+    Ok(CapturedSnapshot {
+        frame,
+        capture_scale_factor,
+        monitors,
+    })
+}
+
+fn uses_native_wayland_capture() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        capture_linux::native_wayland_selected()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn finish_capture(ui: &CaptureWindow, state: &Rc<RefCell<Controller>>, finished: CaptureFinished) {
+    let finished_started = Instant::now();
+    let CaptureFinished { session_id, result } = finished;
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(message) => {
+            let mut controller = state.borrow_mut();
+            let events = controller.dispatch_runtime(RuntimeCommand::FrameFailed {
+                session_id,
+                message: message.clone(),
+            });
+            if events.iter().any(|event| {
+                matches!(event, RuntimeEvent::CaptureFailed { session_id: failed, .. } if *failed == session_id)
+            }) {
+                controller.set_status(format!("截图失败：{message}"));
+                controller.log.event(
+                    "capture.failed",
+                    format!("session={} error={message}", session_id.get()),
+                );
+            }
+            return;
+        }
+    };
+
+    {
+        let mut controller = state.borrow_mut();
+        let events = controller.dispatch_runtime(RuntimeCommand::FrameReady {
+            session_id,
+            frame: (*snapshot.frame).clone(),
+        });
+        let accepted = events.iter().any(|event| {
+            matches!(event, RuntimeEvent::CaptureReady { session_id: ready } if *ready == session_id)
+        });
+        if !accepted {
+            if let Some(message) = events.iter().find_map(|event| match event {
+                RuntimeEvent::CaptureFailed { message, .. } => Some(message),
+                _ => None,
+            }) {
+                controller.log.event(
+                    "capture.failed",
+                    format!("session={} error={message}", session_id.get()),
+                );
+            } else {
+                controller.log.event(
+                    "capture.stale",
+                    format!("session={} ignored=true", session_id.get()),
+                );
+            }
+            return;
+        }
+        controller.frame = snapshot.frame;
+        controller.monitors = snapshot.monitors;
+        controller.scale_factor = controller
+            .config
+            .ui_scale_factor
+            .unwrap_or(snapshot.capture_scale_factor);
+        controller.status.clear();
+        let bounds = controller.frame.bounds();
+        sync_window_geometry(ui, &controller, bounds);
+        refresh_ui(ui, &controller);
+    }
+
+    let show_started = Instant::now();
+    if let Err(error) = ui.show() {
+        let mut controller = state.borrow_mut();
+        controller.set_status(format!("无法显示截图窗口：{error}"));
+        controller.log.event(
+            "capture.overlay.show.error",
+            format!("session={} error={error}", session_id.get()),
+        );
+        return;
+    }
+    {
+        let mut controller = state.borrow_mut();
+        controller
+            .log
+            .duration("capture.overlay.show", show_started);
+        reconcile_window_scale(ui, &mut controller, session_id, false);
+        controller.sync_snap_exclusions(ui);
+        controller.log.event(
+            "capture.overlay.ready",
+            format!(
+                "session={} scale_factor={:.3} position=({}, {}) size={}x{} total_ms={:.3}",
+                session_id.get(),
+                controller.scale_factor,
+                controller.frame.origin.x,
+                controller.frame.origin.y,
+                controller.frame.width,
+                controller.frame.height,
+                finished_started.elapsed().as_secs_f64() * 1000.0,
+            ),
+        );
+    }
+
+    let state = state.clone();
+    let ui_weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(1), move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let mut controller = state.borrow_mut();
+        if controller.runtime.active_session_id() == Some(session_id) {
+            reconcile_window_scale(&ui, &mut controller, session_id, true);
+        }
+    });
+}
+
+fn reconcile_window_scale(
+    ui: &CaptureWindow,
+    controller: &mut Controller,
+    session_id: CaptureSessionId,
+    deferred: bool,
+) {
+    let actual_scale = ui.window().scale_factor() as f64;
+    let previous_scale = controller.scale_factor;
+    if controller.config.ui_scale_factor.is_none() {
+        controller.scale_factor = actual_scale.max(0.1);
+    }
+    let bounds = controller.frame.bounds();
+    sync_window_geometry(ui, controller, bounds);
+    if (previous_scale - controller.scale_factor).abs() > 0.01 || deferred {
+        refresh_ui(ui, controller);
+        controller.log.event(
+            "capture.scale_reconciled",
+            format!(
+                "session={} deferred={} previous={previous_scale:.3} ui={actual_scale:.3}",
+                session_id.get(),
+                deferred,
+            ),
+        );
+    }
+}
+
+fn placeholder_frame() -> Arc<CapturedFrame> {
+    Arc::new(CapturedFrame::new(
+        Arc::<[u8]>::from([0, 0, 0, 0]),
+        1,
+        1,
+        4,
+        PhysicalPoint::ZERO,
+        PixelFormat::Rgba8,
+    ))
 }
 
 fn state_label(state: &CaptureSessionState) -> &'static str {
@@ -814,8 +1060,14 @@ impl Controller {
                 RuntimeEvent::Session(CaptureEvent::Error(error)) => {
                     self.set_status(error.to_string())
                 }
+                RuntimeEvent::CaptureFailed { message, .. } => self.set_status(message.clone()),
                 RuntimeEvent::StatusChanged(message) => self.set_status(message.clone()),
-                RuntimeEvent::Rejected(error) => self.set_status(error.to_string()),
+                RuntimeEvent::Rejected(error) => {
+                    self.log.event("runtime.rejected", error);
+                    if !matches!(error, RuntimeError::StaleCaptureSession { .. }) {
+                        self.set_status(error.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -864,27 +1116,28 @@ impl Controller {
             "cancel" => {
                 let apply_started = Instant::now();
                 self.apply(CaptureCommand::Cancel);
-                self.log.duration("shutdown.cancel.apply", apply_started);
+                self.log.duration("overlay.cancel.apply", apply_started);
                 let hide_started = Instant::now();
                 match ui.hide() {
                     Ok(()) => self.log.event(
-                        "shutdown.cancel.hide",
+                        "overlay.cancel.hide",
                         format!(
                             "ok=true duration_ms={:.3}",
                             hide_started.elapsed().as_secs_f64() * 1000.0
                         ),
                     ),
                     Err(error) => self.log.event(
-                        "shutdown.cancel.hide",
+                        "overlay.cancel.hide",
                         format!(
                             "ok=false duration_ms={:.3} error={error}",
                             hide_started.elapsed().as_secs_f64() * 1000.0
                         ),
                     ),
                 }
-                let quit_started = Instant::now();
-                let _ = slint::quit_event_loop();
-                self.log.duration("shutdown.cancel.quit", quit_started);
+                self.host.snap().set_excluded_windows(&[]);
+                self.overlay_token = None;
+                self.frame = placeholder_frame();
+                ui.set_frame_image(image_from_frame(&self.frame));
                 return;
             }
             "copy" | "save" | "pin" | "ask-ai" => {
@@ -1022,7 +1275,12 @@ impl Controller {
             .iter()
             .any(|event| matches!(event, RuntimeEvent::CloseOverlay))
         {
+            self.apply(CaptureCommand::Cancel);
             let _ = ui.hide();
+            self.host.snap().set_excluded_windows(&[]);
+            self.overlay_token = None;
+            self.frame = placeholder_frame();
+            ui.set_frame_image(image_from_frame(&self.frame));
         }
     }
 
@@ -1373,7 +1631,6 @@ fn copy_document_to_clipboard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capture_core::capture::PixelFormat;
 
     #[test]
     fn editing_input_origin_stays_on_full_frame_overlay() {
@@ -1386,9 +1643,16 @@ mod tests {
             PixelFormat::Rgba8,
         );
         let mut runtime = CaptureRuntime::default();
-        runtime.dispatch(RuntimeCommand::BeginCapture);
+        let session_id = runtime
+            .dispatch(RuntimeCommand::BeginCapture)
+            .into_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::CaptureRequested { session_id } => Some(session_id),
+                _ => None,
+            })
+            .expect("capture request");
+        runtime.dispatch(RuntimeCommand::FrameReady { session_id, frame });
         for command in [
-            CaptureCommand::FrameReady(frame),
             CaptureCommand::BeginFreeSelection(PhysicalPoint::new(-2300, 100)),
             CaptureCommand::UpdateFreeSelection(PhysicalPoint::new(-2100, 240)),
             CaptureCommand::CommitSelection,

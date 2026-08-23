@@ -87,6 +87,7 @@ component ToolbarButton inherits Rectangle {
 }
 
 export component CaptureWindow inherits Window {
+    in property <bool> warmup;
     in property <image> frame-image;
     in property <float> selection-x;
     in property <float> selection-y;
@@ -135,9 +136,10 @@ export component CaptureWindow inherits Window {
 
     no-frame: true;
     always-on-top: true;
-    background: #101318;
+    background: root.warmup ? transparent : #101318;
 
     Rectangle {
+        visible: !root.warmup;
         background: #101318;
 
         Image {

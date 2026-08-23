@@ -45,6 +45,16 @@ impl ActionRequestId {
     }
 }
 
+/// Correlates an asynchronous capture result with the request that created it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CaptureSessionId(u64);
+
+impl CaptureSessionId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Result of a host-side action such as clipboard copy or file save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionCompletion {
@@ -70,6 +80,14 @@ impl ActionCompletion {
 #[derive(Debug, Clone)]
 pub enum RuntimeCommand {
     BeginCapture,
+    FrameReady {
+        session_id: CaptureSessionId,
+        frame: capture_core::capture::CapturedFrame,
+    },
+    FrameFailed {
+        session_id: CaptureSessionId,
+        message: String,
+    },
     Capture(CaptureCommand),
     SetPolicy(RuntimePolicy),
     CompleteAction {
@@ -82,7 +100,16 @@ pub enum RuntimeCommand {
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     Session(CaptureEvent),
-    CaptureStarted,
+    CaptureRequested {
+        session_id: CaptureSessionId,
+    },
+    CaptureReady {
+        session_id: CaptureSessionId,
+    },
+    CaptureFailed {
+        session_id: CaptureSessionId,
+        message: String,
+    },
     PolicyChanged(RuntimePolicy),
     ActionRequested {
         request_id: ActionRequestId,
@@ -96,6 +123,11 @@ pub enum RuntimeEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     UnknownActionRequest(ActionRequestId),
+    LifecycleCommandRequiresRuntime,
+    StaleCaptureSession {
+        received: CaptureSessionId,
+        active: Option<CaptureSessionId>,
+    },
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -104,6 +136,23 @@ impl std::fmt::Display for RuntimeError {
             Self::UnknownActionRequest(request_id) => {
                 write!(formatter, "unknown action request: {}", request_id.get())
             }
+            Self::LifecycleCommandRequiresRuntime => write!(
+                formatter,
+                "capture lifecycle commands must be dispatched through the runtime"
+            ),
+            Self::StaleCaptureSession { received, active } => match active {
+                Some(active) => write!(
+                    formatter,
+                    "stale capture session: received {}, active {}",
+                    received.get(),
+                    active.get()
+                ),
+                None => write!(
+                    formatter,
+                    "stale capture session: received {}, no capture is active",
+                    received.get()
+                ),
+            },
         }
     }
 }
@@ -115,6 +164,8 @@ impl std::error::Error for RuntimeError {}
 pub struct CaptureRuntime {
     session: CaptureSession,
     policy: RuntimePolicy,
+    next_capture_session_id: u64,
+    active_session_id: Option<CaptureSessionId>,
     next_action_request_id: u64,
     pending_actions: HashMap<ActionRequestId, ActionId>,
 }
@@ -130,6 +181,8 @@ impl CaptureRuntime {
         Self {
             session: CaptureSession::new(),
             policy,
+            next_capture_session_id: 1,
+            active_session_id: None,
             next_action_request_id: 1,
             pending_actions: HashMap::new(),
         }
@@ -147,6 +200,10 @@ impl CaptureRuntime {
         self.session.timing()
     }
 
+    pub fn active_session_id(&self) -> Option<CaptureSessionId> {
+        self.active_session_id
+    }
+
     pub fn hover_candidate(&self) -> Option<&capture_core::SnapCandidate> {
         self.session.hover_candidate()
     }
@@ -161,6 +218,11 @@ impl CaptureRuntime {
     pub fn dispatch(&mut self, command: RuntimeCommand) -> Vec<RuntimeEvent> {
         match command {
             RuntimeCommand::BeginCapture => self.begin_capture(),
+            RuntimeCommand::FrameReady { session_id, frame } => self.frame_ready(session_id, frame),
+            RuntimeCommand::FrameFailed {
+                session_id,
+                message,
+            } => self.frame_failed(session_id, message),
             RuntimeCommand::Capture(command) => self.dispatch_capture(command),
             RuntimeCommand::SetPolicy(policy) => {
                 self.policy = policy.clone();
@@ -176,12 +238,85 @@ impl CaptureRuntime {
     fn begin_capture(&mut self) -> Vec<RuntimeEvent> {
         self.pending_actions.clear();
         self.session = CaptureSession::new();
-        let mut events = vec![RuntimeEvent::CaptureStarted];
-        events.extend(self.dispatch_capture(CaptureCommand::Begin));
+        let session_id = self.allocate_capture_session_id();
+        self.active_session_id = Some(session_id);
+        let mut events = vec![RuntimeEvent::CaptureRequested { session_id }];
+        events.extend(self.apply_capture(CaptureCommand::Begin));
         events
     }
 
     fn dispatch_capture(&mut self, command: CaptureCommand) -> Vec<RuntimeEvent> {
+        if matches!(
+            command,
+            CaptureCommand::Begin | CaptureCommand::FrameReady(_)
+        ) {
+            return vec![RuntimeEvent::Rejected(
+                RuntimeError::LifecycleCommandRequiresRuntime,
+            )];
+        }
+        let canceling = matches!(command, CaptureCommand::Cancel);
+        let events = self.apply_capture(command);
+        if canceling {
+            self.pending_actions.clear();
+            self.active_session_id = None;
+        }
+        events
+    }
+
+    fn frame_ready(
+        &mut self,
+        session_id: CaptureSessionId,
+        frame: capture_core::capture::CapturedFrame,
+    ) -> Vec<RuntimeEvent> {
+        if self.active_session_id != Some(session_id) {
+            return self.stale_capture(session_id);
+        }
+        let mut events = self.apply_capture(CaptureCommand::FrameReady(frame));
+        if matches!(self.session.state(), CaptureSessionState::Selecting(_)) {
+            events.push(RuntimeEvent::CaptureReady { session_id });
+        } else if let Some(message) = events.iter().find_map(|event| match event {
+            RuntimeEvent::Session(CaptureEvent::Error(error)) => Some(error.to_string()),
+            _ => None,
+        }) {
+            self.pending_actions.clear();
+            self.active_session_id = None;
+            events.extend(self.apply_capture(CaptureCommand::Cancel));
+            events.push(RuntimeEvent::CaptureFailed {
+                session_id,
+                message,
+            });
+        }
+        events
+    }
+
+    fn frame_failed(&mut self, session_id: CaptureSessionId, message: String) -> Vec<RuntimeEvent> {
+        if self.active_session_id != Some(session_id) {
+            return self.stale_capture(session_id);
+        }
+        self.pending_actions.clear();
+        self.active_session_id = None;
+        let mut events = self.apply_capture(CaptureCommand::Cancel);
+        events.push(RuntimeEvent::CaptureFailed {
+            session_id,
+            message,
+        });
+        events
+    }
+
+    fn stale_capture(&self, received: CaptureSessionId) -> Vec<RuntimeEvent> {
+        vec![RuntimeEvent::Rejected(RuntimeError::StaleCaptureSession {
+            received,
+            active: self.active_session_id,
+        })]
+    }
+
+    fn allocate_capture_session_id(&mut self) -> CaptureSessionId {
+        let session_id = CaptureSessionId(self.next_capture_session_id);
+        self.next_capture_session_id = self.next_capture_session_id.checked_add(1).unwrap_or(1);
+        session_id
+    }
+
+    fn apply_capture(&mut self, command: CaptureCommand) -> Vec<RuntimeEvent> {
         let session_events = self.session.apply(command);
         let completed = session_events
             .iter()
@@ -199,6 +334,7 @@ impl CaptureRuntime {
         }
         if completed {
             self.pending_actions.clear();
+            self.active_session_id = None;
         }
         events
     }
@@ -290,10 +426,24 @@ mod tests {
 
     fn editing_runtime(policy: RuntimePolicy) -> CaptureRuntime {
         let mut runtime = CaptureRuntime::new(policy);
-        runtime.dispatch(RuntimeCommand::BeginCapture);
-        runtime.dispatch(RuntimeCommand::Capture(CaptureCommand::FrameReady(frame())));
+        let session_id = begin_capture(&mut runtime);
+        runtime.dispatch(RuntimeCommand::FrameReady {
+            session_id,
+            frame: frame(),
+        });
         runtime.dispatch(RuntimeCommand::Capture(CaptureCommand::CommitSelection));
         runtime
+    }
+
+    fn begin_capture(runtime: &mut CaptureRuntime) -> CaptureSessionId {
+        runtime
+            .dispatch(RuntimeCommand::BeginCapture)
+            .into_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::CaptureRequested { session_id } => Some(session_id),
+                _ => None,
+            })
+            .expect("capture request")
     }
 
     fn request_action(runtime: &mut CaptureRuntime, action: ActionId) -> ActionRequestId {
@@ -316,7 +466,7 @@ mod tests {
 
         assert!(events
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::CaptureStarted)));
+            .any(|event| matches!(event, RuntimeEvent::CaptureRequested { .. })));
         assert!(matches!(runtime.state(), CaptureSessionState::Preparing));
     }
 
@@ -328,11 +478,125 @@ mod tests {
 
         assert!(events
             .iter()
-            .any(|event| matches!(event, RuntimeEvent::CaptureStarted)));
+            .any(|event| matches!(event, RuntimeEvent::CaptureRequested { .. })));
         assert!(!events
             .iter()
             .any(|event| matches!(event, RuntimeEvent::Session(CaptureEvent::Error(_)))));
         assert!(matches!(runtime.state(), CaptureSessionState::Preparing));
+    }
+
+    #[test]
+    fn stale_capture_result_cannot_replace_the_active_session() {
+        let mut runtime = CaptureRuntime::default();
+        let stale = begin_capture(&mut runtime);
+        let active = begin_capture(&mut runtime);
+        let events = runtime.dispatch(RuntimeCommand::FrameReady {
+            session_id: stale,
+            frame: frame(),
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [RuntimeEvent::Rejected(RuntimeError::StaleCaptureSession {
+                received,
+                active: Some(active_id),
+            })] if *received == stale && *active_id == active
+        ));
+        assert_eq!(runtime.active_session_id(), Some(active));
+        assert!(matches!(runtime.state(), CaptureSessionState::Preparing));
+    }
+
+    #[test]
+    fn matching_capture_result_makes_the_session_ready() {
+        let mut runtime = CaptureRuntime::default();
+        let session_id = begin_capture(&mut runtime);
+        let events = runtime.dispatch(RuntimeCommand::FrameReady {
+            session_id,
+            frame: frame(),
+        });
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CaptureReady { session_id: ready } if *ready == session_id
+        )));
+        assert!(matches!(runtime.state(), CaptureSessionState::Selecting(_)));
+    }
+
+    #[test]
+    fn matching_capture_failure_returns_to_idle() {
+        let mut runtime = CaptureRuntime::default();
+        let session_id = begin_capture(&mut runtime);
+        let events = runtime.dispatch(RuntimeCommand::FrameFailed {
+            session_id,
+            message: "capture denied".into(),
+        });
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CaptureFailed { session_id: failed, message }
+                if *failed == session_id && message == "capture denied"
+        )));
+        assert_eq!(runtime.active_session_id(), None);
+        assert!(matches!(runtime.state(), CaptureSessionState::Idle));
+    }
+
+    #[test]
+    fn lifecycle_commands_cannot_bypass_session_correlation() {
+        let mut runtime = CaptureRuntime::default();
+        let events = runtime.dispatch(RuntimeCommand::Capture(CaptureCommand::Begin));
+
+        assert!(matches!(
+            events.as_slice(),
+            [RuntimeEvent::Rejected(
+                RuntimeError::LifecycleCommandRequiresRuntime
+            )]
+        ));
+        assert!(matches!(runtime.state(), CaptureSessionState::Idle));
+    }
+
+    #[test]
+    fn invalid_frame_fails_and_closes_the_capture_session() {
+        let mut runtime = CaptureRuntime::default();
+        let session_id = begin_capture(&mut runtime);
+        let invalid = CapturedFrame::new(
+            vec![0; 3].into(),
+            4,
+            4,
+            16,
+            PhysicalPoint::ZERO,
+            PixelFormat::Rgba8,
+        );
+        let events = runtime.dispatch(RuntimeCommand::FrameReady {
+            session_id,
+            frame: invalid,
+        });
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::CaptureFailed { session_id: failed, .. } if *failed == session_id
+        )));
+        assert_eq!(runtime.active_session_id(), None);
+        assert!(matches!(runtime.state(), CaptureSessionState::Idle));
+    }
+
+    #[test]
+    fn cancel_while_preparing_invalidates_the_capture_result() {
+        let mut runtime = CaptureRuntime::default();
+        let session_id = begin_capture(&mut runtime);
+        runtime.dispatch(RuntimeCommand::Capture(CaptureCommand::Cancel));
+        let events = runtime.dispatch(RuntimeCommand::FrameReady {
+            session_id,
+            frame: frame(),
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [RuntimeEvent::Rejected(RuntimeError::StaleCaptureSession {
+                received,
+                active: None,
+            })] if *received == session_id
+        ));
+        assert!(matches!(runtime.state(), CaptureSessionState::Idle));
     }
 
     #[test]

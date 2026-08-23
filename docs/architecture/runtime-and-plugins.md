@@ -48,6 +48,19 @@ This keeps clipboard and window ownership out of the runtime while allowing the
 runtime to apply policy after the result. For example, a successful Copy can
 emit `CloseOverlay` when `copy_disposition` is `CloseOverlay`.
 
+## Capture Flow
+
+`BeginCapture` creates a new `CaptureSessionId` and emits `CaptureRequested`.
+The host hides the overlay, performs capture on a worker thread, and returns
+either `FrameReady { session_id, frame }` or
+`FrameFailed { session_id, message }`. Results for an older or already closed
+session are rejected and cannot replace the active capture. The overlay is
+shown only after the matching frame has been accepted.
+
+The Slint host keeps the event loop resident while all windows are hidden. It
+owns global hotkeys, tray integration, capture workers, and explicit shutdown;
+Cancel resets and hides the current overlay without terminating the process.
+
 ## Plugin Preparation
 
 Only declarative `PluginDescriptor` and owned `PluginActionId` types are kept at
@@ -62,12 +75,9 @@ Plugins will not receive arbitrary access to `RuntimeCommand`.
 
 ## Next Integration Steps
 
-1. Keep the process alive and make `BeginCapture` request a new host capture.
-2. Add capture session IDs before capture work becomes asynchronous.
-3. Add a settings repository in the host and pass only `RuntimePolicy` into the
+1. Add a settings repository in the host and pass only `RuntimePolicy` into the
    runtime.
-4. Register platform global hotkeys; hotkey events dispatch `BeginCapture`.
-5. Change cancel/complete behavior from quitting the Slint event loop to hiding
-   and resetting the overlay for the next session.
-6. Introduce one real plugin use case before defining manifests, permissions,
+2. Make the default shortcut configurable and persist platform registration
+   failures as actionable settings diagnostics.
+3. Introduce one real plugin use case before defining manifests, permissions,
    or an IPC wire format.

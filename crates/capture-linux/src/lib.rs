@@ -10,7 +10,7 @@
 pub mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::LinuxPlatform;
+pub use linux::{native_wayland_selected, LinuxPlatform};
 
 #[cfg(not(target_os = "linux"))]
 pub mod non_linux {

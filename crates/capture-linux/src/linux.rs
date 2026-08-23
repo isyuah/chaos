@@ -48,10 +48,12 @@ const UTF8_STRING: &[u8] = b"UTF8_STRING";
 
 /// Linux capture backend.
 ///
-/// X11 is used when `DISPLAY` is available. Pure Wayland uses the ScreenCast
-/// portal and PipeWire. The portal asks the user to choose a monitor or virtual
-/// desktop for each synchronous capture request, which keeps permission and
-/// session ownership explicit at the Core boundary.
+/// Native Wayland sessions use the ScreenCast portal and PipeWire even when an
+/// XWayland `DISPLAY` is also present. Set `CAPTURE_LINUX_BACKEND=x11` to force
+/// the X11 path, or `CAPTURE_LINUX_BACKEND=wayland` to force the portal path.
+/// The portal asks the user to choose a monitor or virtual desktop for each
+/// synchronous capture request, which keeps permission and session ownership
+/// explicit at the Core boundary.
 pub struct LinuxCaptureBackend;
 
 impl CaptureBackend for LinuxCaptureBackend {
@@ -68,26 +70,17 @@ impl CaptureBackend for LinuxCaptureBackend {
     }
 
     fn monitors(&self) -> Result<Vec<MonitorInfo>, CaptureError> {
+        if native_wayland_selected() {
+            return query_wayland_monitors();
+        }
         if std::env::var_os("DISPLAY").is_some() {
             return enumerate_monitors(&connect_x11()?);
-        }
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            return query_wayland_monitors();
         }
         enumerate_monitors(&connect_x11()?)
     }
 
     fn capture_monitor(&self, id: MonitorId) -> Result<CapturedFrame, CaptureError> {
-        if std::env::var_os("DISPLAY").is_some() {
-            let display = connect_x11()?;
-            let monitors = enumerate_monitors(&display)?;
-            let monitor = monitors
-                .iter()
-                .find(|monitor| monitor.id == id)
-                .ok_or(CaptureError::MonitorNotFound(id))?;
-            return capture_virtual_desktop_x11(&display)?.crop(monitor.bounds);
-        }
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if native_wayland_selected() {
             let (frame, monitor) = capture_wayland(SourceType::Monitor)?;
             if monitor.id != id {
                 return Err(CaptureError::MonitorNotFound(id));
@@ -104,13 +97,25 @@ impl CaptureBackend for LinuxCaptureBackend {
     }
 
     fn capture_virtual_desktop(&self) -> Result<CapturedFrame, CaptureError> {
-        if std::env::var_os("DISPLAY").is_some() {
-            return capture_virtual_desktop_x11(&connect_x11()?);
-        }
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if native_wayland_selected() {
             return capture_wayland(SourceType::Virtual).map(|(frame, _)| frame);
         }
         capture_virtual_desktop_x11(&connect_x11()?)
+    }
+}
+
+pub fn native_wayland_selected() -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return false;
+    }
+    match std::env::var("CAPTURE_LINUX_BACKEND") {
+        Ok(value) if value.eq_ignore_ascii_case("x11") => false,
+        Ok(value) if value.eq_ignore_ascii_case("wayland") => true,
+        _ => {
+            std::env::var("XDG_SESSION_TYPE")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("wayland"))
+                || std::env::var_os("DISPLAY").is_none()
+        }
     }
 }
 

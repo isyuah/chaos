@@ -50,11 +50,17 @@ verification, known limitations, and frontend integration contract.
 
 `apps/capture-slint` is the working Slint frontend and is part of the workspace;
 it consumes the same Core crates and platform adapters as the CLI. The QML
-frontend remains a separate evaluation target and is not included yet. On a
-desktop Linux session, `cargo run -p capture-slint` uses the XDG ScreenCast
-portal/PipeWire path on native Wayland. By default the frontend captures the
-virtual desktop; set `CAPTURE_MONITOR=N` to force one monitor for isolated
-testing.
+frontend remains a separate evaluation target and is not included yet. The app
+starts hidden as a resident process; use `Ctrl+Shift+S` or the tray menu to
+capture, Cancel only hides the overlay, and the tray Exit command shuts the
+process down. Set `CAPTURE_ON_STARTUP=1` only for an immediate development
+capture. By default the frontend captures the virtual desktop; set
+`CAPTURE_MONITOR=N` to force one monitor for isolated testing.
+
+On Linux, native Wayland sessions use the XDG GlobalShortcuts and ScreenCast
+portals plus PipeWire, even when XWayland also exposes `DISPLAY`. X11 sessions
+use the native global-hotkey and X11 capture paths. Set
+`CAPTURE_LINUX_BACKEND=x11` or `wayland` to override automatic selection.
 If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 `docs/CORE_CHANGE_REQUEST_TEMPLATE.md`) instead of forking the Core.
 
@@ -62,11 +68,11 @@ If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 
 `capture-slint` records timestamped latency events to stderr. Set
 `CAPTURE_SLINT_LOG` to also append the same events to a file. The log includes
-backend startup, monitor enumeration, capture and RGBA conversion, window
-creation, first pointer-down handling, snap queries, sampled pointer input, and
-visual refresh durations. Startup also records the initial window resize and
-session handoff; closing records cancel, hide, event-loop, and resource-drop
-durations.
+resident startup, renderer warmup, monitor enumeration, asynchronous capture,
+RGBA conversion, overlay presentation, first pointer-down handling, snap
+queries, sampled pointer input, and visual refresh durations. Capture events
+carry a session ID so stale worker results are visible and cannot replace a
+newer session.
 
 PowerShell example:
 
@@ -76,9 +82,9 @@ $env:SLINT_BACKEND = "skia"
 cargo run -p capture-slint
 ```
 
-For a smaller startup sample, set `$env:CAPTURE_MONITOR = "0"`; remove that
-variable to measure the default virtual-desktop capture. On Linux, use the
-equivalent `CAPTURE_SLINT_LOG=/tmp/capture-slint.log SLINT_BACKEND=skia`
-environment variables. Reproduce one selection and one pen stroke, then
-inspect the `startup.*`, `input.down.*`, `snap.*`, `visual.*`, and
-`render.*` entries.
+After `startup.resident_ready`, press `Ctrl+Shift+S`, complete or cancel the
+selection, then press the shortcut again. Inspect `capture.requested`,
+`capture.frame`, `capture.overlay.ready`, `input.*`, `snap.*`, `visual.*`, and
+`render.*`. For monitor-isolated testing, set `$env:CAPTURE_MONITOR = "0"`;
+remove it to restore virtual-desktop capture. On Linux, use equivalent shell
+environment variables.

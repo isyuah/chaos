@@ -29,3 +29,15 @@ raw-window-handle = "0.6"
 
 [build-dependencies]
 slint-build = "=1.17.1"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+global-hotkey = "0.8.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = { version = "0.24.2", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = "0.12.3"
+futures-util = "0.3"
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "tokio"] }
+tokio = { version = "1", features = ["rt", "time"] }

@@ -114,8 +114,10 @@ Provides the same two traits behind `#[cfg(target_os = "linux")]`. X11 uses
 RandR 1.5 monitor enumeration, root-window `GetImage` capture, and EWMH client
 stacking/window geometry for snap candidates. Native Wayland uses the XDG
 ScreenCast portal and a short-lived PipeWire consumer to obtain an authorized
-single frame. Pure Wayland has no global window-list protocol, so window-level
-snap remains unavailable there; XWayland continues to use the X11 path.
+single frame. A Wayland session prefers this native path even when XWayland is
+available, with `CAPTURE_LINUX_BACKEND` as an explicit override. Wayland has no
+global window-list protocol, so native window-level snap remains unavailable;
+an available XWayland connection can only expose X11 windows.
 
 ## 3. What each frontend implements (NOT in Core)
 
