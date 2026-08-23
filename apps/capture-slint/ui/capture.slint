@@ -669,7 +669,10 @@ export component PinWindow inherits Window {
     in-out property <bool> pin-always-on-top: true;
     in property <string> status;
     in property <int> status-revision;
+    in property <string> zoom-text;
+    in property <int> zoom-revision;
     private property <bool> status-visible;
+    private property <bool> zoom-visible;
     callback run-action(string);
     callback pointer-down(float, float);
     callback pointer-move(float, float);
@@ -686,6 +689,13 @@ export component PinWindow inherits Window {
         }
     }
 
+    changed zoom-revision => {
+        if (root.zoom-text != "") {
+            root.zoom-visible = true;
+            pin-zoom-timer.restart();
+        }
+    }
+
     pin-status-timer := Timer {
         interval: 2400ms;
         running: false;
@@ -695,10 +705,24 @@ export component PinWindow inherits Window {
         }
     }
 
+    pin-zoom-timer := Timer {
+        interval: 900ms;
+        running: false;
+        triggered() => {
+            root.zoom-visible = false;
+            self.stop();
+        }
+    }
+
     Rectangle {
         background: #0b1015;
-        Image { source: root.pin-image; width: parent.width; height: parent.height; image-fit: contain; }
-        ContextMenuArea {
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.pin-image;
+            image-fit: contain;
+        }
+        pin-context-menu := ContextMenuArea {
             Menu {
                 MenuItem {
                     title: root.pin-always-on-top ? "取消置顶" : "置顶";
@@ -724,6 +748,9 @@ export component PinWindow inherits Window {
             pin-drag := TouchArea {
                 mouse-cursor: self.pressed ? grabbing : grab;
                 pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                        pin-context-menu.show({ x: self.mouse-x, y: self.mouse-y });
+                    }
                     if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                         root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px);
                     }
@@ -741,6 +768,34 @@ export component PinWindow inherits Window {
                     }
                     return reject;
                 }
+            }
+        }
+
+        Rectangle {
+            border-width: 1px;
+            border-color: #64748b;
+            background: transparent;
+        }
+
+        Rectangle {
+            visible: root.zoom-visible;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: max(72px, pin-zoom-text.preferred-width + 28px);
+            height: 38px;
+            border-radius: 7px;
+            background: #101820e8;
+            border-width: 1px;
+            border-color: #ffffff38;
+            pin-zoom-text := Text {
+                width: parent.width;
+                height: parent.height;
+                text: root.zoom-text;
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
         }
 
