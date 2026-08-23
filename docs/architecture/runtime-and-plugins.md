@@ -61,6 +61,23 @@ The Slint host keeps the event loop resident while all windows are hidden. It
 owns global hotkeys, tray integration, capture workers, and explicit shutdown;
 Cancel resets and hides the current overlay without terminating the process.
 
+## Settings Ownership
+
+The Slint host owns a versioned JSON settings document in the platform config
+directory. It persists the global shortcut, screenshot directory, successful
+copy behavior, and the latest shortcut registration diagnostic. Writes use a
+temporary file in the same directory followed by an atomic replacement. A
+missing file selects defaults; an unreadable, malformed, or newer-schema file
+is reported and left untouched instead of being silently replaced.
+
+Only `RuntimePolicy` crosses into `capture-runtime`. Paths, shortcut syntax,
+folder dialogs, and platform registration remain host concerns. Windows and
+X11 replace a shortcut transactionally by retaining the old registration until
+the new one succeeds. On Wayland the configured shortcut is a preferred trigger
+for a new XDG GlobalShortcuts portal session; the compositor remains the final
+authority and may ask the user to approve or change it. Portal registration
+failures are returned to the settings UI and persisted for the next launch.
+
 ## Plugin Preparation
 
 Only declarative `PluginDescriptor` and owned `PluginActionId` types are kept at
@@ -73,11 +90,18 @@ which effects it may request, whether it runs in-process or out-of-process, and
 how permissions, cancellation, timeouts, crashes, and protocol versions work.
 Plugins will not receive arbitrary access to `RuntimeCommand`.
 
+OCR is the intended first vertical slice. Its actual engine and product flow
+must first establish whether it needs the flattened crop, language hints,
+progress/cancellation, clipboard access, network access, or a structured text
+result. Only then should the host introduce a `PluginActionContext`, bounded
+result types, and explicit permissions. This avoids accidentally turning a
+temporary DLL, WASM, or IPC experiment into the permanent plugin ABI.
+
 ## Next Integration Steps
 
-1. Add a settings repository in the host and pass only `RuntimePolicy` into the
-   runtime.
-2. Make the default shortcut configurable and persist platform registration
-   failures as actionable settings diagnostics.
-3. Introduce one real plugin use case before defining manifests, permissions,
-   or an IPC wire format.
+1. Complete interactive acceptance of settings and shortcut replacement on a
+   real Windows desktop and both X11 and Wayland Linux sessions.
+2. Implement one OCR vertical slice and use its observed requirements to define
+   the first execution context, result, cancellation, and permission contracts.
+3. Choose in-process, DLL, WASM, or IPC isolation only after the OCR engine and
+   its deployment constraints are known.

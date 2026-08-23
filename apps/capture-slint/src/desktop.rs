@@ -1,29 +1,133 @@
+use crate::settings::Shortcut;
 use std::sync::mpsc::Sender;
 
 #[derive(Debug, Clone)]
 pub enum DesktopCommand {
     Capture,
+    Settings,
     Quit,
     #[cfg(target_os = "linux")]
-    Error(String),
+    ShortcutStatus {
+        shortcut: String,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutApply {
+    Active,
+    #[cfg(target_os = "linux")]
+    AwaitingPortal,
 }
 
 pub struct DesktopStartup {
     pub integration: DesktopIntegration,
     pub messages: Vec<String>,
+    pub shortcut_error: Option<String>,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+const NO_HOTKEY: u32 = u32::MAX;
+
+#[cfg(any(windows, target_os = "linux"))]
+struct NativeHotkey {
+    manager: global_hotkey::GlobalHotKeyManager,
+    hotkey: global_hotkey::hotkey::HotKey,
+    active_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+impl NativeHotkey {
+    fn register(
+        shortcut: &Shortcut,
+        active_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> Result<Self, String> {
+        use global_hotkey::GlobalHotKeyManager;
+        use std::sync::atomic::Ordering;
+
+        let hotkey = shortcut
+            .global_hotkey()
+            .map_err(|error| error.to_string())?;
+        let manager = GlobalHotKeyManager::new().map_err(|error| error.to_string())?;
+        manager
+            .register(hotkey)
+            .map_err(|error| error.to_string())?;
+        active_id.store(hotkey.id(), Ordering::Release);
+        Ok(Self {
+            manager,
+            hotkey,
+            active_id,
+        })
+    }
+
+    fn replace(&mut self, shortcut: &Shortcut) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+
+        let next = shortcut
+            .global_hotkey()
+            .map_err(|error| error.to_string())?;
+        if next == self.hotkey {
+            return Ok(());
+        }
+        self.manager
+            .register(next)
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.manager.unregister(self.hotkey) {
+            let _ = self.manager.unregister(next);
+            return Err(format!("无法释放原快捷键：{error}"));
+        }
+        self.hotkey = next;
+        self.active_id.store(next.id(), Ordering::Release);
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn install_native_hotkey_handler(
+    sender: Sender<DesktopCommand>,
+    active_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) {
+    use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+    use std::sync::atomic::Ordering;
+
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        if event.id == active_id.load(Ordering::Acquire) && event.state == HotKeyState::Pressed {
+            let _ = sender.send(DesktopCommand::Capture);
+        }
+    }));
 }
 
 #[cfg(windows)]
 pub struct DesktopIntegration {
-    _hotkey: Option<global_hotkey::GlobalHotKeyManager>,
+    active_hotkey_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    hotkey: Option<NativeHotkey>,
     _tray: Option<tray_icon::TrayIcon>,
 }
 
 #[cfg(windows)]
-pub fn initialize(sender: Sender<DesktopCommand>, _native_wayland: bool) -> DesktopStartup {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+impl DesktopIntegration {
+    pub fn set_shortcut(&mut self, shortcut: &Shortcut) -> Result<ShortcutApply, String> {
+        if let Some(hotkey) = &mut self.hotkey {
+            hotkey.replace(shortcut)?;
+        } else {
+            self.hotkey = Some(NativeHotkey::register(
+                shortcut,
+                self.active_hotkey_id.clone(),
+            )?);
+        }
+        Ok(ShortcutApply::Active)
+    }
+}
+
+#[cfg(windows)]
+pub fn initialize(
+    sender: Sender<DesktopCommand>,
+    _native_wayland: bool,
+    shortcut: &Shortcut,
+) -> DesktopStartup {
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
     };
     use tray_icon::{
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -31,12 +135,14 @@ pub fn initialize(sender: Sender<DesktopCommand>, _native_wayland: bool) -> Desk
     };
 
     let mut messages = Vec::new();
-    let capture_item = MenuItem::new("截图\tCtrl+Shift+S", true, None);
+    let capture_item = MenuItem::new("截图", true, None);
+    let settings_item = MenuItem::new("设置", true, None);
     let quit_item = MenuItem::new("退出", true, None);
     let separator = PredefinedMenuItem::separator();
     let capture_item_id = capture_item.id().clone();
+    let settings_item_id = settings_item.id().clone();
     let quit_item_id = quit_item.id().clone();
-    let menu = match Menu::with_items(&[&capture_item, &separator, &quit_item]) {
+    let menu = match Menu::with_items(&[&capture_item, &settings_item, &separator, &quit_item]) {
         Ok(menu) => Some(menu),
         Err(error) => {
             messages.push(format!("desktop.tray.menu.error error={error}"));
@@ -48,6 +154,8 @@ pub fn initialize(sender: Sender<DesktopCommand>, _native_wayland: bool) -> Desk
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id() == &capture_item_id {
             let _ = tray_sender.send(DesktopCommand::Capture);
+        } else if event.id() == &settings_item_id {
+            let _ = tray_sender.send(DesktopCommand::Settings);
         } else if event.id() == &quit_item_id {
             let _ = tray_sender.send(DesktopCommand::Quit);
         }
@@ -74,33 +182,28 @@ pub fn initialize(sender: Sender<DesktopCommand>, _native_wayland: bool) -> Desk
         }
     });
 
-    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
-    let hotkey_id = hotkey.id();
-    let hotkey_sender = sender;
-    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-        if event.id == hotkey_id && event.state == HotKeyState::Pressed {
-            let _ = hotkey_sender.send(DesktopCommand::Capture);
-        }
-    }));
-    let hotkey_manager = match GlobalHotKeyManager::new().and_then(|manager| {
-        manager.register(hotkey)?;
-        Ok(manager)
-    }) {
-        Ok(manager) => Some(manager),
+    let active_hotkey_id = Arc::new(AtomicU32::new(NO_HOTKEY));
+    install_native_hotkey_handler(sender, active_hotkey_id.clone());
+    let (hotkey, shortcut_error) = match NativeHotkey::register(shortcut, active_hotkey_id.clone())
+    {
+        Ok(hotkey) => (Some(hotkey), None),
         Err(error) => {
-            messages.push(format!(
-                "desktop.hotkey.error shortcut=Ctrl+Shift+S error={error}"
-            ));
-            None
+            active_hotkey_id.store(NO_HOTKEY, Ordering::Release);
+            (
+                None,
+                Some(format!("无法注册全局快捷键 {shortcut}：{error}")),
+            )
         }
     };
 
     DesktopStartup {
         integration: DesktopIntegration {
-            _hotkey: hotkey_manager,
+            active_hotkey_id,
+            hotkey,
             _tray: tray,
         },
         messages,
+        shortcut_error,
     }
 }
 
@@ -140,10 +243,19 @@ impl ksni::Tray for LinuxTray {
         use ksni::menu::{MenuItem, StandardItem};
         vec![
             StandardItem {
-                label: "截图  Ctrl+Shift+S".into(),
+                label: "截图".into(),
                 icon_name: "camera-photo".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.sender.send(DesktopCommand::Capture);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "设置".into(),
+                icon_name: "preferences-system".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.sender.send(DesktopCommand::Settings);
                 }),
                 ..Default::default()
             }
@@ -163,19 +275,57 @@ impl ksni::Tray for LinuxTray {
 }
 
 #[cfg(target_os = "linux")]
-pub struct DesktopIntegration {
-    _hotkey: Option<global_hotkey::GlobalHotKeyManager>,
-    _tray: Option<ksni::blocking::Handle<LinuxTray>>,
-    _portal_thread: Option<std::thread::JoinHandle<()>>,
+struct PortalHotkey {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _thread: std::thread::JoinHandle<()>,
 }
 
 #[cfg(target_os = "linux")]
-pub fn initialize(sender: Sender<DesktopCommand>, native_wayland: bool) -> DesktopStartup {
-    use global_hotkey::{
-        hotkey::{Code, HotKey, Modifiers},
-        GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
-    };
+impl Drop for PortalHotkey {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct DesktopIntegration {
+    sender: Sender<DesktopCommand>,
+    native_wayland: bool,
+    active_hotkey_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    hotkey: Option<NativeHotkey>,
+    _tray: Option<ksni::blocking::Handle<LinuxTray>>,
+    portal_hotkey: Option<PortalHotkey>,
+}
+
+#[cfg(target_os = "linux")]
+impl DesktopIntegration {
+    pub fn set_shortcut(&mut self, shortcut: &Shortcut) -> Result<ShortcutApply, String> {
+        if self.native_wayland {
+            let portal = spawn_wayland_shortcut(self.sender.clone(), shortcut.clone())?;
+            self.portal_hotkey = Some(portal);
+            return Ok(ShortcutApply::AwaitingPortal);
+        }
+        if let Some(hotkey) = &mut self.hotkey {
+            hotkey.replace(shortcut)?;
+        } else {
+            self.hotkey = Some(NativeHotkey::register(
+                shortcut,
+                self.active_hotkey_id.clone(),
+            )?);
+        }
+        Ok(ShortcutApply::Active)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn initialize(
+    sender: Sender<DesktopCommand>,
+    native_wayland: bool,
+    shortcut: &Shortcut,
+) -> DesktopStartup {
     use ksni::blocking::TrayMethods;
+    use std::sync::{atomic::AtomicU32, Arc};
 
     let mut messages = Vec::new();
     let tray = match (LinuxTray {
@@ -190,70 +340,98 @@ pub fn initialize(sender: Sender<DesktopCommand>, native_wayland: bool) -> Deskt
         }
     };
 
-    let (hotkey_manager, portal_thread) = if native_wayland {
-        let portal_sender = sender.clone();
-        let thread = std::thread::Builder::new()
-            .name("wayland-global-shortcut".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build();
-                let result = runtime
-                    .map_err(|error| error.to_string())
-                    .and_then(|runtime| {
-                        runtime.block_on(run_wayland_shortcut(portal_sender.clone()))
-                    });
-                if let Err(error) = result {
-                    let _ = portal_sender.send(DesktopCommand::Error(format!(
-                        "Wayland 全局快捷键不可用：{error}"
-                    )));
-                }
-            });
-        match thread {
-            Ok(thread) => (None, Some(thread)),
-            Err(error) => {
-                messages.push(format!("desktop.hotkey.thread.error error={error}"));
-                (None, None)
-            }
+    let active_hotkey_id = Arc::new(AtomicU32::new(NO_HOTKEY));
+    let (hotkey, portal_hotkey, shortcut_error) = if native_wayland {
+        match spawn_wayland_shortcut(sender.clone(), shortcut.clone()) {
+            Ok(portal) => (None, Some(portal), None),
+            Err(error) => (
+                None,
+                None,
+                Some(format!("无法启动 Wayland 全局快捷键：{error}")),
+            ),
         }
     } else {
-        let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
-        let hotkey_id = hotkey.id();
-        let hotkey_sender = sender;
-        GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-            if event.id == hotkey_id && event.state == HotKeyState::Pressed {
-                let _ = hotkey_sender.send(DesktopCommand::Capture);
-            }
-        }));
-        let manager = match GlobalHotKeyManager::new().and_then(|manager| {
-            manager.register(hotkey)?;
-            Ok(manager)
-        }) {
-            Ok(manager) => Some(manager),
-            Err(error) => {
-                messages.push(format!(
-                    "desktop.hotkey.error shortcut=Ctrl+Shift+S error={error}"
-                ));
-                None
-            }
-        };
-        (manager, None)
+        install_native_hotkey_handler(sender.clone(), active_hotkey_id.clone());
+        match NativeHotkey::register(shortcut, active_hotkey_id.clone()) {
+            Ok(hotkey) => (Some(hotkey), None, None),
+            Err(error) => (
+                None,
+                None,
+                Some(format!("无法注册全局快捷键 {shortcut}：{error}")),
+            ),
+        }
     };
 
     DesktopStartup {
         integration: DesktopIntegration {
-            _hotkey: hotkey_manager,
+            sender,
+            native_wayland,
+            active_hotkey_id,
+            hotkey,
             _tray: tray,
-            _portal_thread: portal_thread,
+            portal_hotkey,
         },
         messages,
+        shortcut_error,
     }
 }
 
 #[cfg(target_os = "linux")]
-async fn run_wayland_shortcut(sender: Sender<DesktopCommand>) -> Result<(), String> {
+fn spawn_wayland_shortcut(
+    sender: Sender<DesktopCommand>,
+    shortcut: Shortcut,
+) -> Result<PortalHotkey, String> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let thread_cancelled = cancelled.clone();
+    let shortcut_text = shortcut.to_string();
+    let thread = std::thread::Builder::new()
+        .name("wayland-global-shortcut".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build();
+            let result = runtime
+                .map_err(|error| error.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(run_wayland_shortcut(
+                        sender.clone(),
+                        shortcut,
+                        thread_cancelled.clone(),
+                    ))
+                });
+            if let Err(error) = result {
+                if !thread_cancelled.load(Ordering::Acquire) {
+                    let _ = sender.send(DesktopCommand::ShortcutStatus {
+                        shortcut: shortcut_text,
+                        error: Some(format!("Wayland 全局快捷键不可用：{error}")),
+                    });
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(PortalHotkey {
+        cancelled,
+        _thread: thread,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn run_wayland_shortcut(
+    sender: Sender<DesktopCommand>,
+    shortcut: Shortcut,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
-    use futures_util::StreamExt;
+    use futures_util::{
+        future::{select, Either},
+        pin_mut, StreamExt,
+    };
+    use std::sync::atomic::Ordering;
 
     let shortcuts = GlobalShortcuts::new()
         .await
@@ -262,10 +440,11 @@ async fn run_wayland_shortcut(sender: Sender<DesktopCommand>) -> Result<(), Stri
         .create_session()
         .await
         .map_err(|error| error.to_string())?;
+    let trigger = shortcut.portal_trigger();
     let request = shortcuts
         .bind_shortcuts(
             &session,
-            &[NewShortcut::new("capture", "截取屏幕").preferred_trigger(Some("CTRL+SHIFT+s"))],
+            &[NewShortcut::new("capture", "截取屏幕").preferred_trigger(Some(trigger.as_str()))],
             None,
         )
         .await
@@ -278,14 +457,38 @@ async fn run_wayland_shortcut(sender: Sender<DesktopCommand>) -> Result<(), Stri
     {
         return Err("桌面门户没有绑定截图快捷键".into());
     }
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _ = sender.send(DesktopCommand::ShortcutStatus {
+        shortcut: shortcut.to_string(),
+        error: None,
+    });
 
     let mut activated = shortcuts
         .receive_activated()
         .await
         .map_err(|error| error.to_string())?;
-    while let Some(event) = activated.next().await {
-        if event.shortcut_id() == "capture" && sender.send(DesktopCommand::Capture).is_err() {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
             break;
+        }
+        let event = activated.next();
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(100));
+        pin_mut!(event, timeout);
+        match select(event, timeout).await {
+            Either::Left((Some(event), _)) => {
+                if event.shortcut_id() == "capture"
+                    && !cancelled.load(Ordering::Acquire)
+                    && sender.send(DesktopCommand::Capture).is_err()
+                {
+                    break;
+                }
+            }
+            Either::Left((None, _)) => {
+                return Err("桌面门户的快捷键事件流已结束".to_string());
+            }
+            Either::Right(_) => {}
         }
     }
     drop(session);

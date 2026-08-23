@@ -1,3 +1,5 @@
+import { Button, CheckBox, LineEdit } from "std-widgets.slint";
+
 component ToolbarGlyph inherits Rectangle {
     in property <string> kind;
     in property <color> glyph-color;
@@ -388,5 +390,119 @@ export component PinWindow inherits Window {
         background: #0b1015;
         Image { source: root.pin-image; width: parent.width; height: parent.height; image-fit: contain; }
         TouchArea { clicked => { root.close-requested(); } }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    in-out property <string> shortcut;
+    in-out property <string> save-directory;
+    in-out property <bool> close-after-copy;
+    in property <string> status;
+    in property <bool> status-is-error;
+
+    callback choose-directory();
+    callback save-settings(string, string, bool);
+    callback cancel();
+
+    title: "Chaos 截图设置";
+    width: 520px;
+    height: 390px;
+    background: #f8fafc;
+
+    Rectangle {
+        background: #f8fafc;
+
+        Text {
+            x: 24px;
+            y: 20px;
+            text: "Chaos 截图";
+            color: #0f172a;
+            font-size: 20px;
+            font-weight: 600;
+        }
+        Text {
+            x: 24px;
+            y: 54px;
+            text: "全局快捷键";
+            color: #475569;
+            font-size: 13px;
+        }
+        LineEdit {
+            x: 24px;
+            y: 76px;
+            width: 472px;
+            text <=> root.shortcut;
+            placeholder-text: "Ctrl+Shift+S";
+        }
+
+        Text {
+            x: 24px;
+            y: 126px;
+            text: "保存目录";
+            color: #475569;
+            font-size: 13px;
+        }
+        LineEdit {
+            x: 24px;
+            y: 148px;
+            width: 390px;
+            text <=> root.save-directory;
+        }
+        Button {
+            x: 422px;
+            y: 148px;
+            width: 74px;
+            height: 32px;
+            text: "浏览";
+            clicked => { root.choose-directory(); }
+        }
+
+        CheckBox {
+            x: 24px;
+            y: 211px;
+            width: 472px;
+            text: "复制成功后关闭截图窗口";
+            checked <=> root.close-after-copy;
+        }
+
+        Text {
+            x: 24px;
+            y: 259px;
+            width: 472px;
+            height: 42px;
+            visible: root.status != "";
+            text: root.status;
+            color: root.status-is-error ? #b91c1c : #166534;
+            font-size: 13px;
+            wrap: word-wrap;
+            vertical-alignment: top;
+        }
+
+        Rectangle {
+            x: 0px;
+            y: 319px;
+            width: parent.width;
+            height: 1px;
+            background: #e2e8f0;
+        }
+        Button {
+            x: 330px;
+            y: 338px;
+            width: 78px;
+            height: 34px;
+            text: "取消";
+            clicked => { root.cancel(); }
+        }
+        Button {
+            x: 418px;
+            y: 338px;
+            width: 78px;
+            height: 34px;
+            text: "保存";
+            primary: true;
+            clicked => {
+                root.save-settings(root.shortcut, root.save-directory, root.close-after-copy);
+            }
+        }
     }
 }

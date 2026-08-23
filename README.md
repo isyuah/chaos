@@ -55,12 +55,23 @@ starts hidden as a resident process; use `Ctrl+Shift+S` or the tray menu to
 capture, Cancel only hides the overlay, and the tray Exit command shuts the
 process down. Set `CAPTURE_ON_STARTUP=1` only for an immediate development
 capture. By default the frontend captures the virtual desktop; set
-`CAPTURE_MONITOR=N` to force one monitor for isolated testing.
+`CAPTURE_MONITOR=N` to force one monitor for isolated testing. Open **设置**
+from the tray menu to change the shortcut, screenshot directory, and whether a
+successful copy closes the capture overlay. Settings are stored atomically in
+`%APPDATA%\chaos-capture\settings.json` on Windows and
+`$XDG_CONFIG_HOME/chaos-capture/settings.json` (normally
+`~/.config/chaos-capture/settings.json`) on Linux. When the platform exposes a
+Pictures directory, the default screenshot directory is `Chaos Capture` under
+it; saved screenshots receive unique names instead of overwriting the previous
+image.
 
 On Linux, native Wayland sessions use the XDG GlobalShortcuts and ScreenCast
 portals plus PipeWire, even when XWayland also exposes `DISPLAY`. X11 sessions
 use the native global-hotkey and X11 capture paths. Set
 `CAPTURE_LINUX_BACKEND=x11` or `wayland` to override automatic selection.
+On Wayland the configured shortcut is submitted as a preferred portal trigger;
+the desktop's authorization UI remains authoritative and may assign a different
+binding. Registration errors remain visible in Settings after restart.
 If a frontend needs a Core API change, file a `CORE_CHANGE_REQUEST.md` (see
 `docs/CORE_CHANGE_REQUEST_TEMPLATE.md`) instead of forking the Core.
 

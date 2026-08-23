@@ -1,6 +1,7 @@
 #![allow(clippy::type_complexity)]
 
 mod desktop;
+mod settings;
 
 use arboard::{Clipboard, ImageData};
 use capture_actions::{ActionOutcome, CaptureAction, CopyAction, PinAction, SaveAction};
@@ -18,15 +19,16 @@ use capture_platform_api::{CaptureBackend, SnapBackend};
 use capture_render::flatten;
 use capture_runtime::{
     ActionCompletion, ActionRequestId, CaptureRuntime, CaptureSessionId, RuntimeCommand,
-    RuntimeError, RuntimeEvent, RuntimePolicy,
+    RuntimeError, RuntimeEvent,
 };
-use desktop::{DesktopCommand, DesktopIntegration};
+use desktop::{DesktopCommand, DesktopIntegration, ShortcutApply};
 #[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use settings::{AppSettings, SettingsStore, Shortcut};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 use std::cell::RefCell;
 use std::fmt::Display;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -119,18 +121,18 @@ enum HostPlatform {
 
 #[derive(Debug, Clone)]
 struct AppConfig {
-    save_directory: PathBuf,
-    runtime_policy: RuntimePolicy,
+    settings: AppSettings,
+    settings_warning: Option<String>,
     capture_monitor: Option<usize>,
     ui_scale_factor: Option<f64>,
     capture_on_startup: bool,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
+impl AppConfig {
+    fn new(settings: AppSettings, settings_warning: Option<String>) -> Self {
         Self {
-            save_directory: PathBuf::from("."),
-            runtime_policy: RuntimePolicy::default(),
+            settings,
+            settings_warning,
             capture_monitor: std::env::var("CAPTURE_MONITOR")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok()),
@@ -247,7 +249,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_started = Instant::now();
     let ui = CaptureWindow::new()?;
     log.duration("startup.ui_created", ui_started);
-    let config = AppConfig::default();
+    let settings_store = Rc::new(SettingsStore::discover()?);
+    let loaded_settings = settings_store.load_or_default();
+    if let Some(warning) = &loaded_settings.warning {
+        log.event(
+            "settings.load.warning",
+            format!("path={} error={warning}", settings_store.path().display()),
+        );
+    }
+    let config = AppConfig::new(loaded_settings.settings, loaded_settings.warning);
     if let Some(ui_scale_factor) = config.ui_scale_factor {
         log.event(
             "startup.ui_scale_hint",
@@ -257,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame = placeholder_frame();
     let state = Rc::new(RefCell::new(Controller {
         host,
-        runtime: CaptureRuntime::new(config.runtime_policy.clone()),
+        runtime: CaptureRuntime::new(config.settings.runtime_policy()),
         config,
         frame: frame.clone(),
         log: log.clone(),
@@ -567,20 +577,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (desktop_sender, desktop_receiver) = mpsc::channel();
     let (capture_sender, capture_receiver) = mpsc::channel();
     let desktop_integration = Rc::new(RefCell::new(None::<DesktopIntegration>));
+    let settings_window = Rc::new(RefCell::new(None::<SettingsWindow>));
 
     {
         let integration = desktop_integration.clone();
         let desktop_sender = desktop_sender.clone();
         let log = log.clone();
-        let capture_on_startup = state.borrow().config.capture_on_startup;
+        let (capture_on_startup, shortcut) = {
+            let controller = state.borrow();
+            (
+                controller.config.capture_on_startup,
+                controller.config.settings.shortcut.clone(),
+            )
+        };
         let native_wayland = uses_native_wayland_capture();
         let ui_weak = ui.as_weak();
+        let state = state.clone();
+        let settings_store = settings_store.clone();
+        let settings_window = settings_window.clone();
         slint::Timer::single_shot(Duration::ZERO, move || {
-            let startup = desktop::initialize(desktop_sender.clone(), native_wayland);
+            let startup = desktop::initialize(desktop_sender.clone(), native_wayland, &shortcut);
             for message in startup.messages {
                 log.event("desktop.initialize.warning", message);
             }
+            let shortcut_error = startup.shortcut_error;
             *integration.borrow_mut() = Some(startup.integration);
+            record_shortcut_status(
+                &state,
+                &settings_store,
+                &settings_window,
+                shortcut.to_string(),
+                shortcut_error,
+            );
             if let Some(ui) = ui_weak.upgrade() {
                 let warmup_started = Instant::now();
                 ui.set_warmup(true);
@@ -597,7 +625,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             log.event(
                 "desktop.initialize.ready",
-                "shortcut=Ctrl+Shift+S tray=true",
+                format!("shortcut={shortcut} tray=true"),
             );
             if capture_on_startup {
                 let _ = desktop_sender.send(DesktopCommand::Capture);
@@ -610,6 +638,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = state.clone();
         let ui_weak = ui.as_weak();
         let capture_sender = capture_sender.clone();
+        let desktop_integration = desktop_integration.clone();
+        let settings_store = settings_store.clone();
+        let settings_window = settings_window.clone();
         event_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(8),
@@ -620,17 +651,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(command) = desktop_receiver.try_recv() {
                     match command {
                         DesktopCommand::Capture => {
+                            if let Some(settings) = settings_window.borrow().as_ref() {
+                                let _ = settings.hide();
+                            }
                             request_capture(&ui, &state, capture_sender.clone())
                         }
+                        DesktopCommand::Settings => show_settings_window(
+                            &ui,
+                            &state,
+                            &desktop_integration,
+                            &settings_store,
+                            &settings_window,
+                        ),
                         DesktopCommand::Quit => {
                             let _ = ui.hide();
+                            if let Some(settings) = settings_window.borrow().as_ref() {
+                                let _ = settings.hide();
+                            }
                             let _ = slint::quit_event_loop();
                         }
                         #[cfg(target_os = "linux")]
-                        DesktopCommand::Error(message) => {
-                            let mut controller = state.borrow_mut();
-                            controller.log.event("desktop.error", &message);
-                            controller.set_status(message);
+                        DesktopCommand::ShortcutStatus { shortcut, error } => {
+                            record_shortcut_status(
+                                &state,
+                                &settings_store,
+                                &settings_window,
+                                shortcut,
+                                error,
+                            );
                         }
                     }
                 }
@@ -649,12 +697,297 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log.duration("shutdown.event_loop.total", event_loop_started);
     let cleanup_started = Instant::now();
     drop(event_timer);
+    drop(settings_window);
     drop(desktop_integration);
     drop(ui);
     drop(state);
     log.duration("shutdown.resources_drop", cleanup_started);
     log.flush();
     Ok(())
+}
+
+fn show_settings_window(
+    overlay: &CaptureWindow,
+    state: &Rc<RefCell<Controller>>,
+    desktop_integration: &Rc<RefCell<Option<DesktopIntegration>>>,
+    settings_store: &Rc<SettingsStore>,
+    settings_window: &Rc<RefCell<Option<SettingsWindow>>>,
+) {
+    let _ = overlay.hide();
+    {
+        let mut controller = state.borrow_mut();
+        if !matches!(controller.runtime.state(), CaptureSessionState::Idle) {
+            controller.apply(CaptureCommand::Cancel);
+            controller.host.snap().set_excluded_windows(&[]);
+            controller.overlay_token = None;
+            controller.frame = placeholder_frame();
+            overlay.set_frame_image(image_from_frame(&controller.frame));
+        }
+    }
+
+    if settings_window.borrow().is_none() {
+        let settings = match SettingsWindow::new() {
+            Ok(settings) => settings,
+            Err(error) => {
+                state
+                    .borrow()
+                    .log
+                    .event("settings.window.error", format!("error={error}"));
+                return;
+            }
+        };
+
+        {
+            let settings_weak = settings.as_weak();
+            settings.on_cancel(move || {
+                if let Some(settings) = settings_weak.upgrade() {
+                    let _ = settings.hide();
+                }
+            });
+        }
+
+        {
+            let settings_weak = settings.as_weak();
+            settings.on_choose_directory(move || {
+                let Some(settings) = settings_weak.upgrade() else {
+                    return;
+                };
+                let current = PathBuf::from(settings.get_save_directory().as_str());
+                let mut dialog = rfd::FileDialog::new().set_title("选择截图保存目录");
+                if current.is_dir() {
+                    dialog = dialog.set_directory(current);
+                }
+                if let Some(directory) = dialog.pick_folder() {
+                    settings.set_save_directory(directory.to_string_lossy().into_owned().into());
+                    settings.set_status("".into());
+                }
+            });
+        }
+
+        {
+            let settings_weak = settings.as_weak();
+            let state = state.clone();
+            let desktop_integration = desktop_integration.clone();
+            let settings_store = settings_store.clone();
+            settings.on_save_settings(move |shortcut, save_directory, close_after_copy| {
+                let Some(settings_window) = settings_weak.upgrade() else {
+                    return;
+                };
+                let shortcut = match shortcut.as_str().parse::<Shortcut>() {
+                    Ok(shortcut) => shortcut,
+                    Err(error) => {
+                        settings_window.set_status(error.to_string().into());
+                        settings_window.set_status_is_error(true);
+                        return;
+                    }
+                };
+                let save_directory = match prepare_save_directory(save_directory.as_str()) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        settings_window.set_status(error.into());
+                        settings_window.set_status_is_error(true);
+                        return;
+                    }
+                };
+
+                let previous = state.borrow().config.settings.clone();
+                let mut candidate = previous.clone();
+                candidate.shortcut = shortcut;
+                candidate.save_directory = save_directory;
+                candidate.copy_disposition = if close_after_copy {
+                    capture_runtime::CopyDisposition::CloseOverlay
+                } else {
+                    capture_runtime::CopyDisposition::KeepEditorOpen
+                };
+                let should_apply_shortcut =
+                    candidate.shortcut != previous.shortcut || previous.shortcut_error.is_some();
+                if should_apply_shortcut {
+                    candidate.shortcut_error = None;
+                }
+
+                if let Err(error) = settings_store.save(&candidate) {
+                    settings_window.set_status(error.to_string().into());
+                    settings_window.set_status_is_error(true);
+                    return;
+                }
+
+                let shortcut_apply = if should_apply_shortcut {
+                    match desktop_integration.borrow_mut().as_mut() {
+                        Some(integration) => integration.set_shortcut(&candidate.shortcut),
+                        None => Err("桌面集成尚未初始化".to_string()),
+                    }
+                } else {
+                    Ok(ShortcutApply::Active)
+                };
+                let shortcut_apply = match shortcut_apply {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let rollback = settings_store.save(&previous).err();
+                        let message = match rollback {
+                            Some(rollback) => {
+                                format!("快捷键未生效：{error}；同时无法恢复原设置文件：{rollback}")
+                            }
+                            None => format!("快捷键未生效：{error}"),
+                        };
+                        settings_window.set_status(message.into());
+                        settings_window.set_status_is_error(true);
+                        return;
+                    }
+                };
+
+                {
+                    let mut controller = state.borrow_mut();
+                    controller.config.settings = candidate.clone();
+                    controller.config.settings_warning = None;
+                    controller
+                        .dispatch_runtime(RuntimeCommand::SetPolicy(candidate.runtime_policy()));
+                    controller.log.event(
+                        "settings.saved",
+                        format!(
+                            "path={} shortcut={} save_directory={} copy_disposition={:?}",
+                            settings_store.path().display(),
+                            candidate.shortcut,
+                            candidate.save_directory.display(),
+                            candidate.copy_disposition
+                        ),
+                    );
+                }
+                settings_window.set_shortcut(candidate.shortcut.to_string().into());
+                settings_window.set_save_directory(
+                    candidate
+                        .save_directory
+                        .to_string_lossy()
+                        .into_owned()
+                        .into(),
+                );
+                settings_window.set_status_is_error(false);
+                settings_window.set_status(
+                    match shortcut_apply {
+                        ShortcutApply::Active => "设置已保存",
+                        #[cfg(target_os = "linux")]
+                        ShortcutApply::AwaitingPortal => "设置已保存，等待桌面授权快捷键",
+                    }
+                    .into(),
+                );
+            });
+        }
+
+        *settings_window.borrow_mut() = Some(settings);
+    }
+
+    let (current, settings_warning) = {
+        let controller = state.borrow();
+        (
+            controller.config.settings.clone(),
+            controller.config.settings_warning.clone(),
+        )
+    };
+    if let Some(settings) = settings_window.borrow().as_ref() {
+        settings.set_shortcut(current.shortcut.to_string().into());
+        settings.set_save_directory(current.save_directory.to_string_lossy().into_owned().into());
+        settings.set_close_after_copy(
+            current.copy_disposition == capture_runtime::CopyDisposition::CloseOverlay,
+        );
+        let diagnostic = current.shortcut_error.or(settings_warning);
+        settings.set_status_is_error(diagnostic.is_some());
+        settings.set_status(diagnostic.unwrap_or_default().into());
+        if let Err(error) = settings.show() {
+            state
+                .borrow()
+                .log
+                .event("settings.window.show.error", format!("error={error}"));
+        }
+    }
+}
+
+fn record_shortcut_status(
+    state: &Rc<RefCell<Controller>>,
+    settings_store: &SettingsStore,
+    settings_window: &Rc<RefCell<Option<SettingsWindow>>>,
+    shortcut: String,
+    error: Option<String>,
+) {
+    let (updated, log) = {
+        let mut controller = state.borrow_mut();
+        if controller.config.settings.shortcut.to_string() != shortcut {
+            controller.log.event(
+                "desktop.hotkey.status.ignored",
+                format!("shortcut={shortcut} reason=stale"),
+            );
+            return;
+        }
+        let changed = controller.config.settings.shortcut_error != error;
+        controller.config.settings.shortcut_error = error.clone();
+        (
+            changed.then(|| controller.config.settings.clone()),
+            controller.log.clone(),
+        )
+    };
+
+    if let Some(updated) = updated {
+        if let Err(save_error) = settings_store.save(&updated) {
+            log.event(
+                "settings.shortcut_status.persist.error",
+                format!("error={save_error}"),
+            );
+        }
+    }
+    log.event(
+        "desktop.hotkey.status",
+        format!(
+            "shortcut={shortcut} active={} error={}",
+            error.is_none(),
+            error.as_deref().unwrap_or("<none>")
+        ),
+    );
+    if let Some(settings) = settings_window.borrow().as_ref() {
+        settings.set_status_is_error(error.is_some());
+        settings.set_status(error.unwrap_or_else(|| "快捷键已生效".to_string()).into());
+    }
+}
+
+fn prepare_save_directory(value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("保存目录不能为空".to_string());
+    }
+    let mut directory = PathBuf::from(value);
+    if directory.is_relative() {
+        directory = std::env::current_dir()
+            .map_err(|error| format!("无法解析相对保存目录：{error}"))?
+            .join(directory);
+    }
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建保存目录 {}：{error}", directory.display()))?;
+    let metadata = fs::metadata(&directory)
+        .map_err(|error| format!("无法访问保存目录 {}：{error}", directory.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("保存路径不是目录：{}", directory.display()));
+    }
+    directory
+        .canonicalize()
+        .map_err(|error| format!("无法规范化保存目录 {}：{error}", directory.display()))
+}
+
+fn next_capture_path(directory: &std::path::Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("无法创建保存目录 {}：{error}", directory.display()))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("系统时间无效：{error}"))?
+        .as_millis();
+    for sequence in 0..10_000u32 {
+        let name = if sequence == 0 {
+            format!("capture-{timestamp}.png")
+        } else {
+            format!("capture-{timestamp}-{sequence}.png")
+        };
+        let path = directory.join(name);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err("无法生成不重复的截图文件名".to_string())
 }
 
 fn request_capture(
@@ -1189,7 +1522,13 @@ impl Controller {
                 }
             },
             ActionId::SAVE => {
-                let path = self.config.save_directory.join("capture-slint.png");
+                let path = match next_capture_path(&self.config.settings.save_directory) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.complete_action(request_id, false, format!("保存失败：{error}"), ui);
+                        return;
+                    }
+                };
                 match SaveAction::new(&path).invoke(&document) {
                     Ok(ActionOutcome::Saved(path)) => self.complete_action(
                         request_id,
@@ -1664,5 +2003,17 @@ mod tests {
             input_origin(runtime.state(), PhysicalPoint::new(-2560, 0)),
             PhysicalPoint::new(-2560, 0)
         );
+    }
+
+    #[test]
+    fn capture_paths_do_not_reuse_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = next_capture_path(directory.path()).unwrap();
+        fs::write(&first, b"existing screenshot").unwrap();
+
+        let second = next_capture_path(directory.path()).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!second.exists());
     }
 }

@@ -26,6 +26,12 @@ slint = { version = "=1.17.1", default-features = false, features = [
 ] }
 arboard = "3"
 raw-window-handle = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+dirs = "6.0.0"
+tempfile = "3.27.0"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+thiserror = "2"
 
 [build-dependencies]
 slint-build = "=1.17.1"
