@@ -295,7 +295,12 @@ fn capture_virtual_screen() -> Result<CapturedFrame, CaptureError> {
     }
 
     let mut out = vec![0u8; buf.len()];
-    for (src, dst) in buf.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+    for (src, dst) in buf
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+    {
         dst[0] = src[2];
         dst[1] = src[1];
         dst[2] = src[0];

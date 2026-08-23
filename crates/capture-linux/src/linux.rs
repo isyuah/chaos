@@ -544,8 +544,11 @@ fn raw_to_frame(
             .get(source_start..source_end)
             .ok_or_else(|| CaptureError::InvalidFrame("Wayland row is unavailable".to_string()))?;
         let destination = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
-        for (source_pixel, destination_pixel) in
-            source.chunks_exact(4).zip(destination.chunks_exact_mut(4))
+        for (source_pixel, destination_pixel) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(destination.as_chunks_mut::<4>().0.iter_mut())
         {
             match raw.format {
                 VideoFormat::RGBA => destination_pixel.copy_from_slice(source_pixel),
@@ -799,7 +802,7 @@ fn image_to_rgba(
     let pixels = usize::from(width)
         .checked_mul(usize::from(height))
         .ok_or_else(|| CaptureError::InvalidFrame("X11 image dimensions overflow".to_string()))?;
-    if pixels == 0 || data.len() % pixels != 0 {
+    if pixels == 0 || !data.len().is_multiple_of(pixels) {
         return Err(CaptureError::InvalidFrame(
             "X11 image buffer does not contain whole pixels".to_string(),
         ));
@@ -809,7 +812,7 @@ fn image_to_rgba(
         return Err(CaptureError::FormatUnsupported(PixelFormat::Rgb24));
     }
     let mut rgba = vec![0u8; pixels * 4];
-    for (index, output) in rgba.chunks_exact_mut(4).enumerate() {
+    for (index, output) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let source = &data[index * bytes_per_pixel..(index + 1) * bytes_per_pixel];
         let value = match byte_order {
             x11rb::image::ImageOrder::LsbFirst => source

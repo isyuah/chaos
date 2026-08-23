@@ -1314,7 +1314,7 @@ fn image_from_frame(frame: &CapturedFrame) -> Image {
 fn image_from_rgba(width: u32, height: u32, pixels: &[u8]) -> Image {
     let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
     let target = buffer.make_mut_slice();
-    for (pixel, rgba) in target.iter_mut().zip(pixels.chunks_exact(4)) {
+    for (pixel, rgba) in target.iter_mut().zip(pixels.as_chunks::<4>().0.iter()) {
         *pixel = Rgba8Pixel {
             r: rgba[0],
             g: rgba[1],
