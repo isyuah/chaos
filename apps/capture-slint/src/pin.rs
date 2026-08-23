@@ -21,6 +21,18 @@ pub(super) fn configure_pin_window(
                 return;
             };
             match action.as_str() {
+                "toggle-topmost" => {
+                    let always_on_top = !pin.get_pin_always_on_top();
+                    pin.set_pin_always_on_top(always_on_top);
+                    set_pin_status(
+                        &pin,
+                        if always_on_top {
+                            "已置顶"
+                        } else {
+                            "已取消置顶"
+                        },
+                    );
+                }
                 "copy" => match copy_rendered_to_clipboard(&rendered) {
                     Ok(()) => set_pin_status(&pin, "已复制到剪贴板"),
                     Err(error) => set_pin_status(&pin, format!("复制失败：{error}")),

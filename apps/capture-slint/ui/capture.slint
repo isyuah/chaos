@@ -673,6 +673,8 @@ export component PinWindow inherits Window {
     in property <int> zoom-revision;
     private property <bool> status-visible;
     private property <bool> zoom-visible;
+    private property <length> context-menu-x;
+    private property <length> context-menu-y;
     callback run-action(string);
     callback pointer-down(float, float);
     callback pointer-move(float, float);
@@ -685,14 +687,16 @@ export component PinWindow inherits Window {
     changed status-revision => {
         if (root.status != "") {
             root.status-visible = true;
-            pin-status-timer.restart();
+            pin-status-timer.stop();
+            pin-status-timer.start();
         }
     }
 
     changed zoom-revision => {
         if (root.zoom-text != "") {
             root.zoom-visible = true;
-            pin-zoom-timer.restart();
+            pin-zoom-timer.stop();
+            pin-zoom-timer.start();
         }
     }
 
@@ -722,51 +726,81 @@ export component PinWindow inherits Window {
             source: root.pin-image;
             image-fit: contain;
         }
-        pin-context-menu := ContextMenuArea {
-            Menu {
-                MenuItem {
-                    title: root.pin-always-on-top ? "取消置顶" : "置顶";
-                    checked: root.pin-always-on-top;
-                    activated => { root.pin-always-on-top = !root.pin-always-on-top; }
+        pin-drag := TouchArea {
+            mouse-cursor: self.pressed ? grabbing : grab;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                    root.context-menu-x = self.mouse-x;
+                    root.context-menu-y = self.mouse-y;
+                    pin-menu.show();
                 }
-                MenuSeparator { }
-                MenuItem {
-                    title: "复制";
-                    activated => { root.run-action("copy"); }
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    pin-menu.close();
+                    root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px);
                 }
-                MenuItem {
-                    title: "另存为...";
-                    activated => { root.run-action("save-as"); }
+                if (event.kind == PointerEventKind.move && self.pressed) {
+                    root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px);
                 }
-                MenuSeparator { }
-                MenuItem {
-                    title: "关闭";
-                    activated => { root.run-action("close"); }
+                if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                    root.pointer-up();
                 }
             }
-
-            pin-drag := TouchArea {
-                mouse-cursor: self.pressed ? grabbing : grab;
-                pointer-event(event) => {
-                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
-                        pin-context-menu.show({ x: self.mouse-x, y: self.mouse-y });
-                    }
-                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                        root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px);
-                    }
-                    if (event.kind == PointerEventKind.move && self.pressed) {
-                        root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px);
-                    }
-                    if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
-                        root.pointer-up();
-                    }
+            scroll-event(event) => {
+                if (event.modifiers.control && event.delta-y != 0px) {
+                    root.zoom(event.delta-y / 1px, self.mouse-x / 1px, self.mouse-y / 1px);
+                    return accept;
                 }
-                scroll-event(event) => {
-                    if (event.modifiers.control && event.delta-y != 0px) {
-                        root.zoom(event.delta-y / 1px, self.mouse-x / 1px, self.mouse-y / 1px);
-                        return accept;
+                return reject;
+            }
+        }
+
+        pin-menu := PopupWindow {
+            x: root.context-menu-x;
+            y: root.context-menu-y;
+            width: 190px;
+            height: 158px;
+            close-policy: close-on-click-outside;
+
+            Rectangle {
+                background: #ffffff;
+                border-width: 1px;
+                border-color: #d5dce5;
+                border-radius: 7px;
+                drop-shadow-offset-y: 3px;
+                drop-shadow-blur: 10px;
+                drop-shadow-color: #00000024;
+
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    ToolbarMenuItem {
+                        label: root.pin-always-on-top ? "取消置顶" : "置顶";
+                        activated => {
+                            pin-menu.close();
+                            root.run-action("toggle-topmost");
+                        }
                     }
-                    return reject;
+                    ToolbarMenuItem {
+                        label: "复制";
+                        activated => {
+                            pin-menu.close();
+                            root.run-action("copy");
+                        }
+                    }
+                    ToolbarMenuItem {
+                        label: "另存为...";
+                        activated => {
+                            pin-menu.close();
+                            root.run-action("save-as");
+                        }
+                    }
+                    ToolbarMenuItem {
+                        label: "关闭";
+                        activated => {
+                            pin-menu.close();
+                            root.run-action("close");
+                        }
+                    }
                 }
             }
         }
